@@ -10,12 +10,29 @@ from threading import Lock
 
 
 class TransferMeter:
-    """Thread-safe transfer meter with rolling speed, peak speed and file ETA."""
+    """Thread-safe transfer meter with smoothed speed, sustained peak and file ETA.
 
-    def __init__(self, callback=None, emit_interval: float = 0.5, rolling_window: float = 3.0):
+    ``current_bps`` is measured over roughly five seconds by default so buffered
+    socket reads do not look like an instantaneous line-rate spike. ``peak_bps``
+    is the highest rate sustained over a longer window (ten seconds by default,
+    with at least five seconds of evidence) rather than the largest short burst.
+    """
+
+    def __init__(
+        self,
+        callback=None,
+        emit_interval: float = 0.5,
+        rolling_window: float = 5.0,
+        peak_window: float = 10.0,
+        min_current_span: float = 2.0,
+        min_peak_span: float = 5.0,
+    ):
         self.callback = callback
         self.emit_interval = max(0.1, float(emit_interval))
-        self.rolling_window = max(0.5, float(rolling_window))
+        self.rolling_window = max(1.0, float(rolling_window))
+        self.peak_window = max(self.rolling_window, float(peak_window))
+        self.min_current_span = max(0.5, min(float(min_current_span), self.rolling_window))
+        self.min_peak_span = max(self.min_current_span, min(float(min_peak_span), self.peak_window))
         self.lock = Lock()
         self.started_monotonic = time.monotonic()
         self.started_at = datetime.now(timezone.utc)
@@ -26,14 +43,50 @@ class TransferMeter:
         self.last_emit = self.started_monotonic
         self.samples = deque([(self.started_monotonic, 0)])
 
+    def _trim_samples_locked(self, now: float):
+        """Keep enough history for both rolling rates, plus one boundary sample."""
+        cutoff = now - self.peak_window
+        while len(self.samples) > 2 and self.samples[1][0] <= cutoff:
+            self.samples.popleft()
+
+    def _window_rate_locked(self, now: float, window: float, minimum_span: float) -> tuple[float, float]:
+        """Return (bytes/sec, observed span) for a rolling window.
+
+        The newest sample at or before the requested cutoff is used as the
+        baseline. Keeping that boundary sample prevents short callback timing
+        jitter from turning a five-second window into a much shorter burst.
+        """
+        cutoff = now - window
+        sample_time, sample_bytes = self.samples[0]
+        for candidate_time, candidate_bytes in self.samples:
+            if candidate_time <= cutoff:
+                sample_time, sample_bytes = candidate_time, candidate_bytes
+            else:
+                break
+
+        span = max(0.0, now - sample_time)
+        if span < minimum_span:
+            return 0.0, span
+        rate = max(0.0, (self.network_bytes - sample_bytes) / max(span, 0.000001))
+        return rate, span
+
     def _snapshot_locked(self, now: float) -> dict:
         elapsed = max(0.000001, now - self.started_monotonic)
-        while len(self.samples) > 1 and self.samples[0][0] < now - self.rolling_window:
-            self.samples.popleft()
-        sample_time, sample_bytes = self.samples[0]
-        sample_elapsed = max(0.000001, now - sample_time)
-        current_bps = max(0.0, (self.network_bytes - sample_bytes) / sample_elapsed)
-        self.peak_bps = max(self.peak_bps, current_bps)
+        self._trim_samples_locked(now)
+
+        current_bps, current_span = self._window_rate_locked(
+            now,
+            self.rolling_window,
+            self.min_current_span,
+        )
+        sustained_bps, peak_span = self._window_rate_locked(
+            now,
+            self.peak_window,
+            self.min_peak_span,
+        )
+        if peak_span >= self.min_peak_span:
+            self.peak_bps = max(self.peak_bps, sustained_bps)
+
         average_bps = self.network_bytes / elapsed
         files_per_minute = self.completed_files / elapsed * 60.0
         eta_seconds = None
@@ -48,6 +101,10 @@ class TransferMeter:
             "current_mbps": current_bps * 8.0 / 1_000_000.0,
             "average_mbps": average_bps * 8.0 / 1_000_000.0,
             "peak_mbps": self.peak_bps * 8.0 / 1_000_000.0,
+            "current_window_seconds": self.rolling_window,
+            "current_observed_span_seconds": current_span,
+            "peak_window_seconds": self.peak_window,
+            "peak_observed_span_seconds": peak_span,
             "completed_files": int(self.completed_files),
             "total_files": int(self.total_files),
             "files_per_minute": files_per_minute,
@@ -74,8 +131,7 @@ class TransferMeter:
         with self.lock:
             self.network_bytes += int(amount)
             self.samples.append((now, self.network_bytes))
-            while len(self.samples) > 1 and self.samples[0][0] < now - self.rolling_window:
-                self.samples.popleft()
+            self._trim_samples_locked(now)
         self._maybe_emit()
 
     def mark_files(self, completed: int, total: int):
