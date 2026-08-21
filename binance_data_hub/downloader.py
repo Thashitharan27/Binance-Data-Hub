@@ -14,7 +14,6 @@ from .benchmark import (
 )
 from .fast_downloader import (
     DEFAULT_FILE_WORKERS,
-    DEFAULT_MAX_CONNECTIONS,
     DEFAULT_SEGMENTS,
     MAX_CONNECTIONS,
     MAX_FILE_WORKERS,
@@ -25,6 +24,7 @@ from .performance import recent_run_history
 
 DEFAULT_WORKERS = DEFAULT_FILE_WORKERS
 MAX_WORKERS = MAX_FILE_WORKERS
+DEFAULT_MAX_CONNECTIONS = 24
 
 __all__ = [
     "DEFAULT_WORKERS",
