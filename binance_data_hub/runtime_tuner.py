@@ -61,7 +61,10 @@ class ErrorWindow:
     def count(self, seconds: float) -> int:
         now = time.monotonic()
         with self._lock:
-            self._trim_locked(now, max(1.0, float(seconds)))
+            # Keep the full two-hour history. Different callers ask for five-
+            # minute and one-hour windows; a short query must not erase events
+            # that are still relevant to the next hourly decision.
+            self._trim_locked(now, 7200.0)
             cutoff = now - max(1.0, float(seconds))
             return sum(1 for item in self._events if item >= cutoff)
 
