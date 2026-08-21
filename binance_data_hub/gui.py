@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import DATA_ROOT
-from .archive_downloader import DEFAULT_WORKERS, download_archive_library
+from .downloader import DEFAULT_MAX_CONNECTIONS, DEFAULT_SEGMENTS, download_archive_library
 from .catalog import DATASETS, DEFAULT_INTERVALS, INTERVALS, research_core_keys
 
 
@@ -20,14 +20,14 @@ class Worker(QObject):
     finished = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, symbols, datasets, intervals, start, end, workers, verify):
+    def __init__(self, symbols, datasets, intervals, start, end, connections, verify):
         super().__init__()
         self.symbols = symbols
         self.datasets = datasets
         self.intervals = intervals
         self.start = start
         self.end = end
-        self.workers = workers
+        self.connections = connections
         self.verify = verify
         self.cancelled = False
 
@@ -37,9 +37,11 @@ class Worker(QObject):
             def progress(done, total, result):
                 percent = min(99, int(done / max(1, total) * 100))
                 interval = f" {result.task.interval}" if result.task.interval else ""
+                transport = str(getattr(result, "transport", ""))
+                mode = f" [{transport}]" if transport and transport != "existing" else ""
                 self.status.emit(
                     f"{done:,}/{total:,} files — {result.task.symbol} {result.task.dataset}{interval} "
-                    f"{result.task.key}: {result.status}",
+                    f"{result.task.key}: {result.status}{mode}",
                     percent,
                 )
 
@@ -50,7 +52,9 @@ class Worker(QObject):
                 DATA_ROOT,
                 self.start,
                 self.end,
-                workers=self.workers,
+                workers=self.connections,
+                max_connections=self.connections,
+                segments=DEFAULT_SEGMENTS,
                 verify=self.verify,
                 progress=progress,
                 cancelled=lambda: self.cancelled,
@@ -64,8 +68,8 @@ class Worker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Binance USD-M Futures Data Hub — High-Speed Archive Collector")
-        self.resize(1100, 780)
+        self.setWindowTitle("Binance USD-M Futures Data Hub — Adaptive High-Speed Collector")
+        self.resize(1100, 800)
         self.thread = None
         self.worker = None
 
@@ -74,9 +78,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(root)
 
         intro = QLabel(
-            "Fast collector for Binance's public USD-M Futures archive. Files are kept as official ZIPs "
-            "instead of being extracted/merged, minimizing CPU and disk I/O. Crypto Strategy Lab can be "
-            "adapted to this data lake later."
+            "Speed-first collector for Binance's public USD-M Futures archive. Small ZIPs download in parallel; "
+            "large monthly ZIPs automatically use multiple byte-range streams when Binance supports them. "
+            "Official ZIP files are kept intact, avoiding CSV extraction and merge work during collection."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -88,18 +92,28 @@ class MainWindow(QMainWindow):
         self.start = QLineEdit("2020-01-01")
         self.end = QLineEdit()
         self.end.setPlaceholderText("Yesterday / latest published daily archive")
-        self.workers = QSpinBox()
-        self.workers.setRange(1, 64)
-        self.workers.setValue(DEFAULT_WORKERS)
+        self.connections = QSpinBox()
+        self.connections.setRange(1, 64)
+        self.connections.setValue(DEFAULT_MAX_CONNECTIONS)
+        self.connections.setToolTip(
+            "Global cap for active Binance HTTP connections. 32 is the recommended default. "
+            "Small files use one connection; large monthly ZIPs can use up to four connections each."
+        )
         self.verify = QCheckBox("Verify Binance SHA-256 checksums (extra disk read; safer, slightly slower)")
         self.output = QLineEdit(str(DATA_ROOT))
         self.output.setReadOnly(True)
         form.addRow("USD-M symbols", self.symbol)
         form.addRow("Start date", self.start)
         form.addRow("End date", self.end)
-        form.addRow("Parallel downloads", self.workers)
+        form.addRow("Max HTTP connections", self.connections)
         form.addRow("", self.verify)
         form.addRow("Data lake", self.output)
+        speed_note = QLabel(
+            "Adaptive speed mode: up to 32 files can progress together by default. Large monthly 1m/3m/5m, "
+            "trade and order-book archives are automatically split into up to four resumable byte ranges."
+        )
+        speed_note.setWordWrap(True)
+        form.addRow("Speed mode", speed_note)
         layout.addWidget(request)
 
         datasets = QGroupBox("Datasets")
@@ -182,10 +196,12 @@ class MainWindow(QMainWindow):
 
         self.thread = QThread(self)
         self.worker = Worker(
-            symbols, datasets, intervals,
+            symbols,
+            datasets,
+            intervals,
             self.start.text().strip() or None,
             self.end.text().strip() or None,
-            self.workers.value(),
+            self.connections.value(),
             self.verify.isChecked(),
         )
         self.worker.moveToThread(self.thread)
@@ -204,7 +220,7 @@ class MainWindow(QMainWindow):
     def cancel(self):
         if self.worker:
             self.worker.cancelled = True
-            self.status.setText("Cancelling active downloads; completed ZIP files will be kept.")
+            self.status.setText("Cancelling active downloads; completed ZIPs and resumable parts will be kept.")
 
     def done(self, summary):
         self.run_btn.setEnabled(True)
@@ -213,9 +229,11 @@ class MainWindow(QMainWindow):
         self.render_summary(summary)
         counts = summary["counts"]
         gb = summary["bytes_downloaded"] / 1024 / 1024 / 1024
+        segmented = summary.get("segmented_files", 0)
         self.status.setText(
-            f"Finished: {counts['downloaded']} downloaded, {counts['skipped']} already present, "
-            f"{counts['missing']} unavailable, {counts['failed']} failed — {gb:.2f} GB downloaded."
+            f"Finished: {counts['downloaded']} downloaded ({segmented} segmented), "
+            f"{counts['skipped']} already present, {counts['missing']} unavailable, "
+            f"{counts['failed']} failed — {gb:.2f} GB downloaded."
         )
         QApplication.beep()
 
