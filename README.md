@@ -19,7 +19,6 @@ Current transport behavior:
 - eligible large ZIPs automatically use up to four parallel byte-range streams;
 - byte ranges are reassembled into the exact original Binance ZIP;
 - one global HTTP connection cap prevents segmented files from multiplying into uncontrolled connection counts;
-- the recommended starting cap is **32 connections**;
 - partially downloaded normal files and byte-range segments are resumable;
 - existing archives are skipped;
 - optional Binance `.CHECKSUM` SHA-256 verification is available;
@@ -28,6 +27,24 @@ Current transport behavior:
 - missing monthly archives automatically fall back to daily files when that archive family supports both.
 
 The objective is maximum useful throughput with bounded network pressure and minimal CPU/disk work.
+
+## Speed Benchmark / Auto Tune
+
+Internet capacity and international routing can change significantly by time of day, so the Hub can benchmark Binance directly instead of relying on a fixed connection setting.
+
+Press **Speed Benchmark / Auto Tune**. By default the Hub tests:
+
+```text
+4 -> 8 -> 16 -> 24 -> 32 connections
+```
+
+Each level downloads temporary byte ranges from a recent large Binance public archive for 15 seconds by default. Benchmark bytes are discarded rather than added to the data lake. The sample time is configurable from 5 to 30 seconds per level.
+
+The benchmark reports average Mbps, MB/s, transferred bytes and request errors for each connection count. It then automatically selects the **smallest connection count that reaches at least 95% of the fastest measured throughput**. This avoids using 24 or 32 connections when, for example, 8 connections already saturate a slower internet line.
+
+The recommended value is applied to **Max HTTP connections** automatically. Benchmark results are stored in the `speed_benchmarks` table inside `manifest.sqlite`, so the most recent recommendation remains visible after the app restarts.
+
+Running Auto Tune again during peak/off-peak hours is useful when available bandwidth changes materially.
 
 ## Live performance telemetry
 
@@ -44,7 +61,7 @@ The GUI shows live:
 - approximate remaining time based on completed-file rate;
 - configured global connection cap.
 
-A benchmark record is written after every completed run to the `download_runs` table inside `manifest.sqlite`. The GUI shows the most recent runs side-by-side, including connection count, elapsed time, average/peak Mbps, network bytes, files/minute and failures. This makes it easy to compare, for example, 16 vs 32 vs 48 connections using the same type of workload.
+A performance record is written after every completed collection run to the `download_runs` table inside `manifest.sqlite`. The GUI shows the most recent runs side-by-side, including connection count, elapsed time, average/peak Mbps, network bytes, files/minute and failures.
 
 ## Collected USD-M Futures datasets
 
@@ -99,9 +116,7 @@ Choose:
 2. historical date range;
 3. datasets;
 4. intervals for kline-type datasets;
-5. the global **Max HTTP connections** value.
-
-Start at **32 connections**. After comparable runs, use the Recent Performance History table to decide whether a higher value actually improves average Mbps without increasing failures. More connections are not automatically faster once the internet connection, Binance CDN path, CPU or disk becomes the bottleneck.
+5. the global **Max HTTP connections** value, or run **Speed Benchmark / Auto Tune** first.
 
 Use **Research Core** for the derivatives-context datasets most useful for strategy research, or **Select Everything** to mirror every supported archive family.
 

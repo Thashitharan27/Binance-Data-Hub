@@ -13,9 +13,13 @@ from PySide6.QtWidgets import (
 
 from . import DATA_ROOT
 from .downloader import (
+    DEFAULT_BENCHMARK_LEVELS,
+    DEFAULT_BENCHMARK_SECONDS,
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_SEGMENTS,
+    benchmark_connections,
     download_archive_library,
+    recent_benchmark_history,
     recent_run_history,
 )
 from .catalog import DATASETS, DEFAULT_INTERVALS, INTERVALS, research_core_keys
@@ -98,13 +102,56 @@ class Worker(QObject):
             self.failed.emit(traceback.format_exc())
 
 
+class BenchmarkWorker(QObject):
+    status = Signal(str, int)
+    stage = Signal(dict)
+    finished = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, symbol, seconds_per_level):
+        super().__init__()
+        self.symbol = symbol
+        self.seconds_per_level = seconds_per_level
+        self.cancelled = False
+
+    @Slot()
+    def run(self):
+        try:
+            def progress(index, total, snapshot):
+                elapsed = float(snapshot.get("elapsed_seconds", 0))
+                target = max(1.0, float(snapshot.get("target_seconds", self.seconds_per_level)))
+                stage_fraction = 1.0 if snapshot.get("stage_complete") else min(1.0, elapsed / target)
+                percent = min(99, int(((index - 1) + stage_fraction) / max(1, total) * 100))
+                connections = int(snapshot.get("connections", 0))
+                speed = float(snapshot.get("average_mbps", snapshot.get("current_mbps", 0)))
+                self.status.emit(
+                    f"Auto Tune {index}/{total} — {connections} connections: "
+                    f"{speed:.1f} Mbps, {_duration(elapsed)} / {_duration(target)}",
+                    percent,
+                )
+                self.stage.emit(snapshot)
+
+            result = benchmark_connections(
+                DATA_ROOT,
+                self.symbol,
+                levels=DEFAULT_BENCHMARK_LEVELS,
+                seconds_per_level=self.seconds_per_level,
+                progress=progress,
+                cancelled=lambda: self.cancelled,
+            )
+            self.finished.emit(result)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Binance USD-M Futures Data Hub — Adaptive High-Speed Collector")
-        self.resize(1160, 930)
+        self.resize(1180, 1000)
         self.thread = None
         self.worker = None
+        self.operation = None
         self.last_telemetry = {}
 
         root = QWidget()
@@ -130,8 +177,15 @@ class MainWindow(QMainWindow):
         self.connections.setRange(1, 64)
         self.connections.setValue(DEFAULT_MAX_CONNECTIONS)
         self.connections.setToolTip(
-            "Global cap for active Binance HTTP connections. 32 is the recommended starting point. "
-            "Compare the saved benchmark history before increasing it."
+            "Global cap for active Binance HTTP connections. Use Auto Tune to measure the best value "
+            "for the current internet conditions."
+        )
+        self.benchmark_seconds = QSpinBox()
+        self.benchmark_seconds.setRange(5, 30)
+        self.benchmark_seconds.setValue(DEFAULT_BENCHMARK_SECONDS)
+        self.benchmark_seconds.setSuffix(" sec / level")
+        self.benchmark_seconds.setToolTip(
+            "Auto Tune tests 4, 8, 16, 24 and 32 connections. 15 seconds per level takes about 75-90 seconds."
         )
         self.verify = QCheckBox("Verify Binance SHA-256 checksums (extra disk read; safer, slightly slower)")
         self.output = QLineEdit(str(DATA_ROOT))
@@ -140,11 +194,13 @@ class MainWindow(QMainWindow):
         form.addRow("Start date", self.start)
         form.addRow("End date", self.end)
         form.addRow("Max HTTP connections", self.connections)
+        form.addRow("Auto Tune sample time", self.benchmark_seconds)
         form.addRow("", self.verify)
         form.addRow("Data lake", self.output)
         speed_note = QLabel(
             "Adaptive speed mode: small files use one connection; large monthly archives may use up to four "
-            "resumable byte ranges. The connection value is a global cap, not connections per file."
+            "resumable byte ranges. Auto Tune chooses the smallest connection count that reaches at least 95% "
+            "of the fastest measured Binance throughput."
         )
         speed_note.setWordWrap(True)
         form.addRow("Speed mode", speed_note)
@@ -185,13 +241,16 @@ class MainWindow(QMainWindow):
 
         actions = QHBoxLayout()
         self.run_btn = QPushButton("Collect / Update Archives")
+        self.benchmark_btn = QPushButton("Speed Benchmark / Auto Tune")
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         open_btn = QPushButton("Open Data Lake")
         self.run_btn.clicked.connect(self.run_download)
+        self.benchmark_btn.clicked.connect(self.run_benchmark)
         self.cancel_btn.clicked.connect(self.cancel)
         open_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(DATA_ROOT))))
         actions.addWidget(self.run_btn)
+        actions.addWidget(self.benchmark_btn)
         actions.addWidget(self.cancel_btn)
         actions.addWidget(open_btn)
         actions.addStretch(1)
@@ -201,6 +260,18 @@ class MainWindow(QMainWindow):
         self.status = QLabel("Ready.")
         layout.addWidget(self.progress)
         layout.addWidget(self.status)
+
+        benchmark_box = QGroupBox("Auto Tune results")
+        benchmark_layout = QVBoxLayout(benchmark_box)
+        self.benchmark_summary = QLabel("Run Auto Tune when internet conditions change. The recommended value is applied automatically.")
+        self.benchmark_summary.setWordWrap(True)
+        benchmark_layout.addWidget(self.benchmark_summary)
+        self.benchmark_table = QTableWidget(0, 5)
+        self.benchmark_table.setHorizontalHeaderLabels(["Connections", "Average Mbps", "Average MB/s", "Network", "Errors"])
+        self.benchmark_table.setMaximumHeight(155)
+        benchmark_layout.addWidget(self.benchmark_table)
+        layout.addWidget(benchmark_box)
+        self.refresh_benchmark_summary()
 
         performance = QGroupBox("Live performance")
         perf_grid = QGridLayout(performance)
@@ -229,10 +300,10 @@ class MainWindow(QMainWindow):
 
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Dataset", "Downloaded", "Skipped", "Missing", "Failed"])
-        self.table.setMaximumHeight(180)
+        self.table.setMaximumHeight(170)
         layout.addWidget(self.table)
 
-        history_box = QGroupBox("Recent performance history — use this to tune connection count")
+        history_box = QGroupBox("Recent collection performance — compare real runs")
         history_layout = QVBoxLayout(history_box)
         self.history = QTableWidget(0, 8)
         self.history.setHorizontalHeaderLabels([
@@ -250,6 +321,11 @@ class MainWindow(QMainWindow):
     def select_core(self):
         self.select_datasets(research_core_keys())
 
+    def set_busy(self, busy):
+        self.run_btn.setEnabled(not busy)
+        self.benchmark_btn.setEnabled(not busy)
+        self.cancel_btn.setEnabled(busy)
+
     def reset_performance(self):
         self.last_telemetry = {}
         for label in self.perf_labels.values():
@@ -265,8 +341,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Choose data", "Enter one or more symbols, choose datasets, and select at least one interval for kline datasets.")
             return
 
-        self.run_btn.setEnabled(False)
-        self.cancel_btn.setEnabled(True)
+        self.operation = "download"
+        self.set_busy(True)
         self.progress.setValue(0)
         self.status.setText("Planning archive files...")
         self.reset_performance()
@@ -291,9 +367,50 @@ class MainWindow(QMainWindow):
         self.worker.failed.connect(self.thread.quit)
         self.thread.start()
 
+    def run_benchmark(self):
+        symbols = [item.strip().upper().replace("/", "") for item in self.symbol.text().replace(",", " ").split() if item.strip()]
+        symbol = symbols[0] if symbols else "BTCUSDT"
+        self.operation = "benchmark"
+        self.set_busy(True)
+        self.progress.setValue(0)
+        total_seconds = self.benchmark_seconds.value() * len(DEFAULT_BENCHMARK_LEVELS)
+        self.status.setText(
+            f"Finding a recent large Binance archive for Auto Tune. "
+            f"Expected test time ~{_duration(total_seconds)}."
+        )
+        self.benchmark_table.setRowCount(0)
+
+        self.thread = QThread(self)
+        self.worker = BenchmarkWorker(symbol, self.benchmark_seconds.value())
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.status.connect(self.set_status)
+        self.worker.stage.connect(self.set_benchmark_stage)
+        self.worker.finished.connect(self.benchmark_done)
+        self.worker.failed.connect(self.failed)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.failed.connect(self.thread.quit)
+        self.thread.start()
+
     def set_status(self, text, percent):
         self.status.setText(text)
         self.progress.setValue(percent)
+
+    def set_benchmark_stage(self, snapshot):
+        if not snapshot.get("stage_complete"):
+            return
+        rows = self.benchmark_table.rowCount()
+        self.benchmark_table.insertRow(rows)
+        values = [
+            snapshot.get("connections", 0),
+            f"{snapshot.get('average_mbps', 0):.2f}",
+            f"{snapshot.get('average_mb_s', 0):.2f}",
+            _size(snapshot.get("network_bytes", 0)),
+            snapshot.get("errors", 0),
+        ]
+        for col, value in enumerate(values):
+            self.benchmark_table.setItem(rows, col, QTableWidgetItem(str(value)))
+        self.benchmark_table.resizeColumnsToContents()
 
     def set_telemetry(self, snapshot):
         self.last_telemetry = snapshot
@@ -310,11 +427,14 @@ class MainWindow(QMainWindow):
     def cancel(self):
         if self.worker:
             self.worker.cancelled = True
-            self.status.setText("Cancelling active downloads; completed ZIPs and resumable parts will be kept.")
+            if self.operation == "benchmark":
+                self.status.setText("Stopping Auto Tune after the current network read...")
+            else:
+                self.status.setText("Cancelling active downloads; completed ZIPs and resumable parts will be kept.")
 
     def done(self, summary):
-        self.run_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
+        self.set_busy(False)
+        self.operation = None
         self.progress.setValue(100)
         self.render_summary(summary)
         self.set_telemetry(summary.get("performance", {}))
@@ -330,6 +450,28 @@ class MainWindow(QMainWindow):
         )
         QApplication.beep()
 
+    def benchmark_done(self, summary):
+        self.set_busy(False)
+        self.operation = None
+        if summary.get("cancelled"):
+            self.status.setText("Auto Tune cancelled. No connection setting was changed.")
+            return
+        self.progress.setValue(100)
+        recommended = int(summary["recommended_connections"])
+        self.connections.setValue(recommended)
+        efficiency = float(summary.get("efficiency_pct", 0))
+        self.benchmark_summary.setText(
+            f"Recommended: {recommended} connections at {summary['recommended_mbps']:.2f} Mbps. "
+            f"Fastest measured: {summary['best_mbps']:.2f} Mbps at {summary['best_connections']} connections. "
+            f"The recommendation keeps {efficiency:.1f}% of the best speed while using fewer connections."
+        )
+        self.status.setText(
+            f"Auto Tune complete — use {recommended} connections. "
+            f"Measured {summary['recommended_mbps']:.2f} Mbps; best {summary['best_mbps']:.2f} Mbps."
+        )
+        self.refresh_benchmark_summary(preserve_current=True)
+        QApplication.beep()
+
     def render_summary(self, summary):
         by_dataset = {}
         for result in summary["results"]:
@@ -342,6 +484,21 @@ class MainWindow(QMainWindow):
             for col, value in enumerate(values):
                 self.table.setItem(row, col, QTableWidgetItem(str(value)))
         self.table.resizeColumnsToContents()
+
+    def refresh_benchmark_summary(self, preserve_current=False):
+        try:
+            rows = recent_benchmark_history(DATA_ROOT, 1)
+        except Exception:
+            rows = []
+        if not rows:
+            return
+        item = rows[0]
+        if not preserve_current:
+            self.benchmark_summary.setText(
+                f"Last Auto Tune: {item.get('recommended_connections', 0)} connections at "
+                f"{item.get('recommended_mbps', 0):.2f} Mbps; fastest test "
+                f"{item.get('best_mbps', 0):.2f} Mbps at {item.get('best_connections', 0)} connections."
+            )
 
     def refresh_history(self):
         try:
@@ -370,8 +527,8 @@ class MainWindow(QMainWindow):
         self.history.resizeColumnsToContents()
 
     def failed(self, detail):
-        self.run_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
+        self.set_busy(False)
+        self.operation = None
         self.status.setText(detail.splitlines()[-1] if detail.splitlines() else detail)
 
 
