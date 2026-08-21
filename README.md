@@ -10,22 +10,41 @@ C:\CryptoBots\Binance Market Data
 
 ## Design: speed first
 
-Version 3 no longer downloads candles and immediately extracts/merges them into giant CSV files.
+The Hub keeps Binance's official `.zip` archives directly instead of extracting and merging giant CSV files during collection.
 
-Instead it:
+Current transport behavior:
 
-- downloads Binance's official `.zip` archives directly;
-- uses up to 64 parallel workers (16 by default) across the planned archive queue;
-- streams large files to disk instead of loading ZIPs into RAM;
-- resumes a partially downloaded archive with HTTP Range requests when the server supports it;
-- skips files that already exist;
-- optionally verifies Binance `.CHECKSUM` SHA-256 files;
-- records download status in `manifest.sqlite`;
-- uses one monthly archive for completed months whenever possible;
-- uses daily archives for the current partial month;
-- automatically falls back from a missing monthly archive to daily files when the dataset supports daily archives.
+- small/daily archives use one resumable HTTP stream each;
+- large monthly 1m/3m/5m kline-family, trade and order-book ZIPs are probed for HTTP Range support;
+- eligible large ZIPs automatically use up to four parallel byte-range streams;
+- byte ranges are reassembled into the exact original Binance ZIP;
+- one global HTTP connection cap prevents segmented files from multiplying into uncontrolled connection counts;
+- the recommended starting cap is **32 connections**;
+- partially downloaded normal files and byte-range segments are resumable;
+- existing archives are skipped;
+- optional Binance `.CHECKSUM` SHA-256 verification is available;
+- completed downloads are validated as ZIP archives before publication;
+- monthly archives are preferred for completed months and daily archives cover the current partial month;
+- missing monthly archives automatically fall back to daily files when that archive family supports both.
 
-This minimizes network requests, decompression time, CSV parsing, and disk writes. Downstream tools can later read or materialize only the data they need.
+The objective is maximum useful throughput with bounded network pressure and minimal CPU/disk work.
+
+## Live performance telemetry
+
+Every collection run measures itself so connection-count tuning can be based on the actual PC, internet connection and Binance CDN path rather than guesses.
+
+The GUI shows live:
+
+- elapsed time;
+- current **MB/s and Mbps**;
+- average speed;
+- peak speed;
+- actual network bytes transferred during the run;
+- files per minute;
+- approximate remaining time based on completed-file rate;
+- configured global connection cap.
+
+A benchmark record is written after every completed run to the `download_runs` table inside `manifest.sqlite`. The GUI shows the most recent runs side-by-side, including connection count, elapsed time, average/peak Mbps, network bytes, files/minute and failures. This makes it easy to compare, for example, 16 vs 32 vs 48 connections using the same type of workload.
 
 ## Collected USD-M Futures datasets
 
@@ -80,7 +99,9 @@ Choose:
 2. historical date range;
 3. datasets;
 4. intervals for kline-type datasets;
-5. number of parallel downloads.
+5. the global **Max HTTP connections** value.
+
+Start at **32 connections**. After comparable runs, use the Recent Performance History table to decide whether a higher value actually improves average Mbps without increasing failures. More connections are not automatically faster once the internet connection, Binance CDN path, CPU or disk becomes the bottleneck.
 
 Use **Research Core** for the derivatives-context datasets most useful for strategy research, or **Select Everything** to mirror every supported archive family.
 

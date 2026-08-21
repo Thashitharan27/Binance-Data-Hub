@@ -1,8 +1,7 @@
 """Binance Data Hub downloader API.
 
-Version 4 keeps Binance's official archives and uses an adaptive transport:
-small files use one resumable stream, while large monthly ZIPs can use multiple
-HTTP byte-range streams under a global connection cap.
+Version 5 keeps Binance's official archives, uses adaptive segmented transport,
+and records live/persistent performance telemetry for tuning connection counts.
 """
 from .archive_downloader import ArchiveTask, DownloadResult, plan_archive_tasks
 from .fast_downloader import (
@@ -14,6 +13,7 @@ from .fast_downloader import (
     MAX_SEGMENTS,
     download_archive_library,
 )
+from .performance import recent_run_history
 
 DEFAULT_WORKERS = DEFAULT_FILE_WORKERS
 MAX_WORKERS = MAX_FILE_WORKERS
@@ -29,4 +29,5 @@ __all__ = [
     "DownloadResult",
     "download_archive_library",
     "plan_archive_tasks",
+    "recent_run_history",
 ]
