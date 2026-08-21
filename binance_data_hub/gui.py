@@ -93,7 +93,7 @@ class MainWindow(QMainWindow):
         self.end = QLineEdit()
         self.end.setPlaceholderText("Yesterday / latest published daily archive")
         self.connections = QSpinBox()
-        self.connections.setRange(1, 128)
+        self.connections.setRange(1, 64)
         self.connections.setValue(DEFAULT_MAX_CONNECTIONS)
         self.connections.setToolTip(
             "Global cap for active Binance HTTP connections. 32 is the recommended default. "
