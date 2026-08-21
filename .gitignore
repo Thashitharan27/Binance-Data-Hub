@@ -1,0 +1,16 @@
+﻿__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+*.key
+*.secret
+data/
+downloads/
+output/
+logs/
+*.log
+Thumbs.db
+.DS_Store
