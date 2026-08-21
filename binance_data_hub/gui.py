@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import traceback
+from datetime import datetime
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot, QUrl
 from PySide6.QtGui import QDesktopServices
@@ -11,12 +12,43 @@ from PySide6.QtWidgets import (
 )
 
 from . import DATA_ROOT
-from .downloader import DEFAULT_MAX_CONNECTIONS, DEFAULT_SEGMENTS, download_archive_library
+from .downloader import (
+    DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_SEGMENTS,
+    download_archive_library,
+    recent_run_history,
+)
 from .catalog import DATASETS, DEFAULT_INTERVALS, INTERVALS, research_core_keys
+
+
+def _duration(seconds):
+    if seconds is None:
+        return "—"
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _size(value):
+    value = float(value or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{value:.2f} TB"
+
+
+def _speed_text(bps):
+    bps = float(bps or 0)
+    mb_s = bps / 1024 / 1024
+    mbps = bps * 8 / 1_000_000
+    return f"{mb_s:.2f} MB/s  ({mbps:.1f} Mbps)"
 
 
 class Worker(QObject):
     status = Signal(str, int)
+    telemetry = Signal(dict)
     finished = Signal(dict)
     failed = Signal(str)
 
@@ -57,6 +89,7 @@ class Worker(QObject):
                 segments=DEFAULT_SEGMENTS,
                 verify=self.verify,
                 progress=progress,
+                telemetry=lambda snapshot: self.telemetry.emit(snapshot),
                 cancelled=lambda: self.cancelled,
             )
             self.status.emit("Archive collection finished.", 100)
@@ -69,9 +102,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Binance USD-M Futures Data Hub — Adaptive High-Speed Collector")
-        self.resize(1100, 800)
+        self.resize(1160, 930)
         self.thread = None
         self.worker = None
+        self.last_telemetry = {}
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -96,8 +130,8 @@ class MainWindow(QMainWindow):
         self.connections.setRange(1, 64)
         self.connections.setValue(DEFAULT_MAX_CONNECTIONS)
         self.connections.setToolTip(
-            "Global cap for active Binance HTTP connections. 32 is the recommended default. "
-            "Small files use one connection; large monthly ZIPs can use up to four connections each."
+            "Global cap for active Binance HTTP connections. 32 is the recommended starting point. "
+            "Compare the saved benchmark history before increasing it."
         )
         self.verify = QCheckBox("Verify Binance SHA-256 checksums (extra disk read; safer, slightly slower)")
         self.output = QLineEdit(str(DATA_ROOT))
@@ -109,8 +143,8 @@ class MainWindow(QMainWindow):
         form.addRow("", self.verify)
         form.addRow("Data lake", self.output)
         speed_note = QLabel(
-            "Adaptive speed mode: up to 32 files can progress together by default. Large monthly 1m/3m/5m, "
-            "trade and order-book archives are automatically split into up to four resumable byte ranges."
+            "Adaptive speed mode: small files use one connection; large monthly archives may use up to four "
+            "resumable byte ranges. The connection value is a global cap, not connections per file."
         )
         speed_note.setWordWrap(True)
         form.addRow("Speed mode", speed_note)
@@ -168,9 +202,45 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress)
         layout.addWidget(self.status)
 
+        performance = QGroupBox("Live performance")
+        perf_grid = QGridLayout(performance)
+        self.perf_labels = {}
+        fields = (
+            ("elapsed", "Elapsed"),
+            ("current", "Current speed"),
+            ("average", "Average speed"),
+            ("peak", "Peak speed"),
+            ("network", "Network transferred"),
+            ("files_min", "Files / minute"),
+            ("eta", "Estimated remaining"),
+            ("connections", "Connection cap"),
+        )
+        for index, (key, title) in enumerate(fields):
+            title_label = QLabel(f"{title}:")
+            value_label = QLabel("—")
+            self.perf_labels[key] = value_label
+            row, col = divmod(index, 4)
+            perf_grid.addWidget(title_label, row * 2, col)
+            perf_grid.addWidget(value_label, row * 2 + 1, col)
+        perf_note = QLabel("ETA is based on completed-file rate, so it is approximate when file sizes vary greatly.")
+        perf_note.setWordWrap(True)
+        perf_grid.addWidget(perf_note, 4, 0, 1, 4)
+        layout.addWidget(performance)
+
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Dataset", "Downloaded", "Skipped", "Missing", "Failed"])
-        layout.addWidget(self.table, 1)
+        self.table.setMaximumHeight(180)
+        layout.addWidget(self.table)
+
+        history_box = QGroupBox("Recent performance history — use this to tune connection count")
+        history_layout = QVBoxLayout(history_box)
+        self.history = QTableWidget(0, 8)
+        self.history.setHorizontalHeaderLabels([
+            "Started", "Connections", "Elapsed", "Avg Mbps", "Peak Mbps", "Network", "Files/min", "Failed"
+        ])
+        history_layout.addWidget(self.history)
+        layout.addWidget(history_box, 1)
+        self.refresh_history()
 
     def select_datasets(self, keys):
         selected = set(keys)
@@ -179,6 +249,12 @@ class MainWindow(QMainWindow):
 
     def select_core(self):
         self.select_datasets(research_core_keys())
+
+    def reset_performance(self):
+        self.last_telemetry = {}
+        for label in self.perf_labels.values():
+            label.setText("—")
+        self.perf_labels["connections"].setText(str(self.connections.value()))
 
     def run_download(self):
         symbols = [item.strip().upper().replace("/", "") for item in self.symbol.text().replace(",", " ").split() if item.strip()]
@@ -193,6 +269,7 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(True)
         self.progress.setValue(0)
         self.status.setText("Planning archive files...")
+        self.reset_performance()
 
         self.thread = QThread(self)
         self.worker = Worker(
@@ -207,6 +284,7 @@ class MainWindow(QMainWindow):
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.status.connect(self.set_status)
+        self.worker.telemetry.connect(self.set_telemetry)
         self.worker.finished.connect(self.done)
         self.worker.failed.connect(self.failed)
         self.worker.finished.connect(self.thread.quit)
@@ -216,6 +294,18 @@ class MainWindow(QMainWindow):
     def set_status(self, text, percent):
         self.status.setText(text)
         self.progress.setValue(percent)
+
+    def set_telemetry(self, snapshot):
+        self.last_telemetry = snapshot
+        self.perf_labels["elapsed"].setText(_duration(snapshot.get("elapsed_seconds")))
+        self.perf_labels["current"].setText(_speed_text(snapshot.get("current_bps")))
+        self.perf_labels["average"].setText(_speed_text(snapshot.get("average_bps")))
+        self.perf_labels["peak"].setText(_speed_text(snapshot.get("peak_bps")))
+        self.perf_labels["network"].setText(_size(snapshot.get("network_bytes")))
+        self.perf_labels["files_min"].setText(f"{snapshot.get('files_per_minute', 0):.1f}")
+        eta = snapshot.get("eta_seconds")
+        self.perf_labels["eta"].setText(f"~{_duration(eta)}" if eta is not None else "—")
+        self.perf_labels["connections"].setText(str(self.connections.value()))
 
     def cancel(self):
         if self.worker:
@@ -227,13 +317,16 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(False)
         self.progress.setValue(100)
         self.render_summary(summary)
+        self.set_telemetry(summary.get("performance", {}))
+        self.refresh_history()
         counts = summary["counts"]
-        gb = summary["bytes_downloaded"] / 1024 / 1024 / 1024
+        perf = summary.get("performance", {})
         segmented = summary.get("segmented_files", 0)
         self.status.setText(
-            f"Finished: {counts['downloaded']} downloaded ({segmented} segmented), "
-            f"{counts['skipped']} already present, {counts['missing']} unavailable, "
-            f"{counts['failed']} failed — {gb:.2f} GB downloaded."
+            f"Finished in {_duration(perf.get('elapsed_seconds'))}: {counts['downloaded']} downloaded "
+            f"({segmented} segmented), {counts['skipped']} present, {counts['missing']} unavailable, "
+            f"{counts['failed']} failed — avg {perf.get('average_mbps', 0):.1f} Mbps, "
+            f"peak {perf.get('peak_mbps', 0):.1f} Mbps."
         )
         QApplication.beep()
 
@@ -249,6 +342,32 @@ class MainWindow(QMainWindow):
             for col, value in enumerate(values):
                 self.table.setItem(row, col, QTableWidgetItem(str(value)))
         self.table.resizeColumnsToContents()
+
+    def refresh_history(self):
+        try:
+            rows = recent_run_history(DATA_ROOT, 10)
+        except Exception:
+            rows = []
+        self.history.setRowCount(len(rows))
+        for row_index, item in enumerate(rows):
+            started = str(item.get("started_at", ""))
+            try:
+                started = datetime.fromisoformat(started).astimezone().strftime("%Y-%m-%d %H:%M")
+            except (TypeError, ValueError):
+                started = started[:16].replace("T", " ")
+            values = [
+                started,
+                item.get("max_connections", 0),
+                _duration(item.get("elapsed_seconds")),
+                f"{item.get('average_mbps', 0):.1f}",
+                f"{item.get('peak_mbps', 0):.1f}",
+                _size(item.get("network_bytes", 0)),
+                f"{item.get('files_per_minute', 0):.1f}",
+                item.get("failed_files", 0),
+            ]
+            for col, value in enumerate(values):
+                self.history.setItem(row_index, col, QTableWidgetItem(str(value)))
+        self.history.resizeColumnsToContents()
 
     def failed(self, detail):
         self.run_btn.setEnabled(True)
