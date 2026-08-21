@@ -55,13 +55,30 @@ The GUI shows live:
 - elapsed time;
 - current **MB/s and Mbps**;
 - average speed;
-- peak speed;
+- sustained peak speed;
 - actual network bytes transferred during the run;
 - files per minute;
 - approximate remaining time based on completed-file rate;
 - configured global connection cap.
 
 A performance record is written after every completed collection run to the `download_runs` table inside `manifest.sqlite`. The GUI shows the most recent runs side-by-side, including connection count, elapsed time, average/peak Mbps, network bytes, files/minute and failures.
+
+## Estimate Size / Time
+
+Press **Estimate Size / Time** after choosing symbols, dates, datasets and intervals. The estimator does not download archive bodies. It checks Binance archive metadata with HEAD requests and uses a one-byte Range metadata probe only when the CDN does not expose `Content-Length` on HEAD.
+
+The estimate reports:
+
+- archive files still needed;
+- total remaining compressed download size;
+- archives already present;
+- resumable partial bytes already on disk;
+- unavailable or unresolved archive files;
+- free disk space and whether it is sufficient;
+- approximate download time using the most recent measured collection or Auto Tune speed;
+- remaining size broken down by dataset.
+
+Resolved historical archive sizes are cached in the `archive_metadata` table inside `manifest.sqlite`, so repeated estimates for the same historical files avoid repeating thousands of metadata requests. Missing-file results use a shorter cache because recently published Binance archives can appear later.
 
 ## Collected USD-M Futures datasets
 
@@ -117,6 +134,8 @@ Choose:
 3. datasets;
 4. intervals for kline-type datasets;
 5. the global **Max HTTP connections** value, or run **Speed Benchmark / Auto Tune** first.
+
+Use **Estimate Size / Time** before very large trade/order-book collections when you want to check disk requirements and approximate duration.
 
 Use **Research Core** for the derivatives-context datasets most useful for strategy research, or **Select Everything** to mirror every supported archive family.
 
