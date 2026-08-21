@@ -54,6 +54,10 @@ def download_archive_library_runtime(
     workers = int(workers)
     max_connections = int(max_connections)
     segments = int(segments)
+    if auto_recalibrate:
+        # Keep enough file workers waiting behind the adjustable gate so a live
+        # increase from 24 to 32 can actually create more HTTP work.
+        workers = max(workers, min(int(auto_max_connections), MAX_FILE_WORKERS))
     threshold_bytes = max(1, int(float(segment_threshold_mb) * 1024 * 1024))
 
     if not 1 <= workers <= MAX_FILE_WORKERS:
