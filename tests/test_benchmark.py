@@ -1,6 +1,8 @@
 import io
 from datetime import date, datetime, timezone
 
+import pytest
+
 from binance_data_hub.benchmark import (
     BenchmarkSource,
     _record,
@@ -36,7 +38,7 @@ def test_recommendation_uses_smallest_connection_count_within_five_percent_of_be
     ])
     assert result["best_connections"] == 16
     assert result["recommended_connections"] == 8
-    assert result["efficiency_pct"] == 98.0
+    assert result["efficiency_pct"] == pytest.approx(98.0)
 
 
 def test_recommendation_moves_higher_when_lower_setting_is_materially_slower():
