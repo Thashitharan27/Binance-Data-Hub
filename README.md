@@ -46,6 +46,20 @@ The recommended value is applied to **Max HTTP connections** automatically. Benc
 
 Running Auto Tune again during peak/off-peak hours is useful when available bandwidth changes materially.
 
+## Hourly long-run auto calibration
+
+Long downloads can span peak and off-peak internet periods. Enable **Auto calibrate connection cap during long downloads** to let the running collector adapt without stopping the archive job or launching a second bandwidth-heavy benchmark.
+
+The default recheck interval is **60 minutes**. At each recheck the Hub:
+
+- measures sustained throughput at the current connection cap using the real archive traffic;
+- briefly tries the next higher cap in 8-connection steps, up to 32;
+- keeps the higher cap only when sustained throughput improves by at least about 5% without retry pressure;
+- restores the previous cap when the higher setting is not meaningfully faster;
+- backs off by one step when repeated retryable network/CDN errors are detected.
+
+The normal starting value remains 24 connections. The auto calibrator changes only the live run and does not permanently rewrite the next launch default, because the best value can differ between daytime and overnight routing.
+
 ## Live performance telemetry
 
 Every collection run measures itself so connection-count tuning can be based on the actual PC, internet connection and Binance CDN path rather than guesses.

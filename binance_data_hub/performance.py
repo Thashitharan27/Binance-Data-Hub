@@ -140,6 +140,11 @@ class TransferMeter:
             self.total_files = max(self.total_files, int(total))
         self._maybe_emit(force=True)
 
+    def snapshot(self) -> dict:
+        """Return a current metrics snapshot without forcing a GUI callback."""
+        with self.lock:
+            return self._snapshot_locked(time.monotonic())
+
     def finish(self, completed: int | None = None, total: int | None = None) -> dict:
         if completed is not None or total is not None:
             with self.lock:
