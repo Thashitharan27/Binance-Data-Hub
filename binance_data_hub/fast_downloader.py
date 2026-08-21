@@ -27,6 +27,7 @@ from .archive_downloader import (
     _sha256,
     plan_archive_tasks,
 )
+from .performance import TransferMeter, record_run_history
 
 CHUNK_SIZE = 1024 * 1024
 DEFAULT_FILE_WORKERS = 32
@@ -104,7 +105,7 @@ def _retry_sleep(exc, attempt: int):
     return min(2**attempt, 10)
 
 
-def _download_single(task: ArchiveTask, final: Path, opener, gate: BoundedSemaphore, cancelled, retries: int = 5) -> DownloadResult:
+def _download_single(task: ArchiveTask, final: Path, opener, gate: BoundedSemaphore, cancelled, on_bytes=None, retries: int = 5) -> DownloadResult:
     part = final.with_name(f"{final.name}.part")
 
     for attempt in range(retries):
@@ -137,6 +138,8 @@ def _download_single(task: ArchiveTask, final: Path, opener, gate: BoundedSemaph
                             if not block:
                                 break
                             output.write(block)
+                            if on_bytes:
+                                on_bytes(len(block))
 
             if not part.exists() or not part.stat().st_size:
                 raise RuntimeError("Binance returned an empty archive.")
@@ -181,7 +184,7 @@ def _segment_ranges(total_size: int, max_segments: int) -> list[tuple[int, int]]
     return ranges
 
 
-def _download_range(task: ArchiveTask, segment_path: Path, start: int, end: int, opener, gate: BoundedSemaphore, cancelled, retries: int = 5) -> None:
+def _download_range(task: ArchiveTask, segment_path: Path, start: int, end: int, opener, gate: BoundedSemaphore, cancelled, on_bytes=None, retries: int = 5) -> None:
     expected_size = end - start + 1
     if segment_path.exists() and segment_path.stat().st_size == expected_size:
         return
@@ -215,6 +218,8 @@ def _download_range(task: ArchiveTask, segment_path: Path, start: int, end: int,
                             if not block:
                                 break
                             output.write(block)
+                            if on_bytes:
+                                on_bytes(len(block))
 
             if segment_path.stat().st_size != expected_size:
                 raise RuntimeError(f"incomplete byte range {start}-{end}: {segment_path.stat().st_size} of {expected_size} bytes")
@@ -233,7 +238,7 @@ def _download_range(task: ArchiveTask, segment_path: Path, start: int, end: int,
             time.sleep(_retry_sleep(exc, attempt))
 
 
-def _download_segmented(task: ArchiveTask, final: Path, total_size: int, max_segments: int, opener, gate: BoundedSemaphore, cancelled) -> DownloadResult:
+def _download_segmented(task: ArchiveTask, final: Path, total_size: int, max_segments: int, opener, gate: BoundedSemaphore, cancelled, on_bytes=None) -> DownloadResult:
     ranges = _segment_ranges(total_size, max_segments)
     segment_dir = final.with_name(f".{final.name}.segments")
     segment_dir.mkdir(parents=True, exist_ok=True)
@@ -243,7 +248,7 @@ def _download_segmented(task: ArchiveTask, final: Path, total_size: int, max_seg
             futures = []
             for index, (start, end) in enumerate(ranges):
                 segment_path = segment_dir / f"{index:02d}-{start}-{end}.part"
-                futures.append(pool.submit(_download_range, task, segment_path, start, end, opener, gate, cancelled))
+                futures.append(pool.submit(_download_range, task, segment_path, start, end, opener, gate, cancelled, on_bytes))
             for future in as_completed(futures):
                 future.result()
 
@@ -324,7 +329,7 @@ def _finalize_download(result: DownloadResult, final: Path, task: ArchiveTask, v
     return result
 
 
-def _download_adaptive(task: ArchiveTask, root: Path, *, verify: bool, cancelled, opener, gate: BoundedSemaphore, max_segments: int, segment_threshold_bytes: int) -> DownloadResult:
+def _download_adaptive(task: ArchiveTask, root: Path, *, verify: bool, cancelled, opener, gate: BoundedSemaphore, max_segments: int, segment_threshold_bytes: int, on_bytes=None) -> DownloadResult:
     final = root / task.relative_path
     final.parent.mkdir(parents=True, exist_ok=True)
 
@@ -342,18 +347,36 @@ def _download_adaptive(task: ArchiveTask, root: Path, *, verify: bool, cancelled
     if _eligible_for_segmentation(task) and max_segments > 1:
         total_size, accepts_ranges = _probe_range_support(task, opener, gate)
         if total_size and accepts_ranges and total_size >= segment_threshold_bytes:
-            segmented = _download_segmented(task, final, total_size, max_segments, opener, gate, cancelled)
+            segmented = _download_segmented(task, final, total_size, max_segments, opener, gate, cancelled, on_bytes)
             if segmented.status == "downloaded":
                 return _finalize_download(segmented, final, task, verify, opener)
             if segmented.status not in {"range-unsupported"}:
                 return segmented
             shutil.rmtree(final.with_name(f".{final.name}.segments"), ignore_errors=True)
 
-    single = _download_single(task, final, opener, gate, cancelled)
+    single = _download_single(task, final, opener, gate, cancelled, on_bytes)
     return _finalize_download(single, final, task, verify, opener)
 
 
-def download_archive_library(symbols, datasets, intervals, root, start_date=None, end_date=None, *, workers: int = DEFAULT_FILE_WORKERS, max_connections: int = DEFAULT_MAX_CONNECTIONS, segments: int = DEFAULT_SEGMENTS, segment_threshold_mb: float = DEFAULT_SEGMENT_THRESHOLD_MB, verify: bool = False, progress=None, cancelled=None, opener=urlopen, today=None) -> dict:
+def download_archive_library(
+    symbols,
+    datasets,
+    intervals,
+    root,
+    start_date=None,
+    end_date=None,
+    *,
+    workers: int = DEFAULT_FILE_WORKERS,
+    max_connections: int = DEFAULT_MAX_CONNECTIONS,
+    segments: int = DEFAULT_SEGMENTS,
+    segment_threshold_mb: float = DEFAULT_SEGMENT_THRESHOLD_MB,
+    verify: bool = False,
+    progress=None,
+    telemetry=None,
+    cancelled=None,
+    opener=urlopen,
+    today=None,
+) -> dict:
     """Mirror requested archives using adaptive single/segmented transports."""
     workers = int(workers)
     max_connections = int(max_connections)
@@ -371,6 +394,7 @@ def download_archive_library(symbols, datasets, intervals, root, start_date=None
     root.mkdir(parents=True, exist_ok=True)
     manifest = Manifest(root / "manifest.sqlite")
     gate = BoundedSemaphore(max_connections)
+    meter = TransferMeter(callback=telemetry)
 
     if isinstance(symbols, str):
         symbol_list = [item for item in symbols.replace(",", " ").split() if item]
@@ -389,6 +413,7 @@ def download_archive_library(symbols, datasets, intervals, root, start_date=None
         tasks.extend(plan_archive_tasks(symbol, datasets, intervals, start_date, end_date, today=today))
     tasks.sort(key=lambda item: (item.symbol, item.dataset, item.interval or "", item.span_start, item.period))
     results: list[DownloadResult] = []
+    meter.mark_files(0, len(tasks))
 
     def run_batch(batch, completed_base, total_hint):
         batch_results = []
@@ -396,15 +421,28 @@ def download_archive_library(symbols, datasets, intervals, root, start_date=None
             return batch_results
         with ThreadPoolExecutor(max_workers=min(workers, len(batch))) as pool:
             futures = {
-                pool.submit(_download_adaptive, task, root, verify=verify, cancelled=cancelled, opener=opener, gate=gate, max_segments=segments, segment_threshold_bytes=threshold_bytes): task
+                pool.submit(
+                    _download_adaptive,
+                    task,
+                    root,
+                    verify=verify,
+                    cancelled=cancelled,
+                    opener=opener,
+                    gate=gate,
+                    max_segments=segments,
+                    segment_threshold_bytes=threshold_bytes,
+                    on_bytes=meter.add_bytes,
+                ): task
                 for task in batch
             }
             for index, future in enumerate(as_completed(futures), 1):
                 result = future.result()
                 manifest.record(result)
                 batch_results.append(result)
+                completed = completed_base + index
+                meter.mark_files(completed, total_hint)
                 if progress:
-                    progress(completed_base + index, total_hint, result)
+                    progress(completed, total_hint, result)
                 if cancelled and cancelled():
                     for pending in futures:
                         pending.cancel()
@@ -427,12 +465,20 @@ def download_archive_library(symbols, datasets, intervals, root, start_date=None
     fallbacks = list(fallback_map.values())
 
     if fallbacks and not (cancelled and cancelled()):
-        results.extend(run_batch(fallbacks, len(primary), len(tasks) + len(fallbacks)))
+        total_with_fallbacks = len(tasks) + len(fallbacks)
+        meter.mark_files(len(primary), total_with_fallbacks)
+        results.extend(run_batch(fallbacks, len(primary), total_with_fallbacks))
 
     statuses = ("downloaded", "skipped", "missing", "failed", "cancelled")
     counts = {status: sum(1 for item in results if item.status == status) for status in statuses}
-    segmented_files = sum(1 for item in results if item.status == "downloaded" and str(getattr(item, "transport", "")).startswith("segmented-"))
-    return {
+    segmented_files = sum(
+        1
+        for item in results
+        if item.status == "downloaded" and str(getattr(item, "transport", "")).startswith("segmented-")
+    )
+    total_processed_target = len(tasks) + len(fallbacks)
+    performance = meter.finish(len(results), total_processed_target)
+    summary = {
         "root": str(root),
         "planned": len(tasks),
         "fallbacks": len(fallbacks),
@@ -440,5 +486,20 @@ def download_archive_library(symbols, datasets, intervals, root, start_date=None
         "bytes_downloaded": sum(item.bytes for item in results if item.status == "downloaded"),
         "counts": counts,
         "segmented_files": segmented_files,
+        "performance": performance,
+        "max_connections": max_connections,
+        "segments": segments,
         "results": results,
     }
+    record_run_history(
+        root,
+        meter=meter,
+        summary=summary,
+        symbols=normalized_symbols,
+        datasets=list(datasets),
+        intervals=list(intervals),
+        max_connections=max_connections,
+        segments=segments,
+        verify=verify,
+    )
+    return summary
