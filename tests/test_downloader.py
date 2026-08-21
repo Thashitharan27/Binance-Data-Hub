@@ -1,18 +1,20 @@
-import csv
 import hashlib
 import io
-import json
-import zipfile
+from datetime import date
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, urlparse
 
-import pytest
-
-from binance_data_hub.downloader import download_klines
+from binance_data_hub.archive_downloader import (
+    _download_one,
+    download_archive_library,
+    plan_archive_tasks,
+)
 
 
 class Response(io.BytesIO):
-    headers = {}
+    def __init__(self, payload=b"", status=200):
+        super().__init__(payload)
+        self.status = status
+        self.headers = {}
 
     def __enter__(self):
         return self
@@ -20,192 +22,111 @@ class Response(io.BytesIO):
     def __exit__(self, *_):
         return False
 
-
-def kline(timestamp, close="1.5"):
-    return [timestamp, "1", "2", "0.5", close, "10"] + [0] * 6
-
-
-def archive_payload(rows, name="ETHUSDT-1m-2020-01.csv"):
-    output = io.StringIO(newline="")
-    writer = csv.writer(output, lineterminator="\n")
-    writer.writerows(rows)
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(name, output.getvalue())
-    return buffer.getvalue()
+    def getcode(self):
+        return self.status
 
 
-def test_rest_only_download_remains_compatible(tmp_path):
-    rows = [kline(1577836800000)]
-    path = tmp_path / "BTCUSDT_1m.csv"
-    result = download_klines(
-        "BTC/USDT",
-        "1m",
-        path,
-        "2020-01-01",
-        "2020-01-01",
-        opener=lambda *_a, **_k: Response(json.dumps(rows).encode()),
+def test_plan_uses_monthly_for_completed_months_and_daily_for_current_month():
+    tasks = plan_archive_tasks(
+        "BTCUSDT",
+        ["klines"],
+        ["1h"],
+        "2026-06-15",
+        "2026-08-20",
+        today=date(2026, 8, 21),
     )
-    assert result["total"] == 1
-    assert result["archives"] == 0
-    assert path.read_text().splitlines()[0] == "timestamp,open,high,low,close,volume"
+    assert [(t.period, t.key) for t in tasks[:2]] == [
+        ("monthly", "2026-06"),
+        ("monthly", "2026-07"),
+    ]
+    daily = [t for t in tasks if t.period == "daily"]
+    assert daily[0].key == "2026-08-01"
+    assert daily[-1].key == "2026-08-20"
+    assert len(daily) == 20
 
 
-def test_automatic_archive_download_verifies_and_publishes(tmp_path):
-    rows = [kline(1577836800000), kline(1577836860000, "1.6")]
-    payload = archive_payload(rows)
+def test_metrics_are_daily_only():
+    tasks = plan_archive_tasks(
+        "ETHUSDT",
+        ["metrics"],
+        ["1m"],
+        "2026-08-18",
+        "2026-08-20",
+        today=date(2026, 8, 21),
+    )
+    assert [(t.period, t.key, t.interval) for t in tasks] == [
+        ("daily", "2026-08-18", None),
+        ("daily", "2026-08-19", None),
+        ("daily", "2026-08-20", None),
+    ]
 
-    def rest_opener(request, **_kwargs):
-        return Response(json.dumps([rows[0]]).encode())
 
-    def archive_opener(request, **_kwargs):
+def test_funding_rate_uses_monthly_archive_only():
+    tasks = plan_archive_tasks(
+        "BTCUSDT",
+        ["fundingRate"],
+        [],
+        "2026-06-01",
+        "2026-08-20",
+        today=date(2026, 8, 21),
+    )
+    assert [(t.period, t.key) for t in tasks] == [
+        ("monthly", "2026-06"),
+        ("monthly", "2026-07"),
+    ]
+
+
+def test_download_streams_zip_and_skips_existing(tmp_path):
+    payload = b"PK" + b"x" * 100
+    expected = hashlib.sha256(payload).hexdigest()
+    task = plan_archive_tasks(
+        "BTCUSDT", ["klines"], ["1h"], "2026-07-01", "2026-07-31", today=date(2026, 8, 21)
+    )[0]
+
+    def opener(request, **_kwargs):
         if request.full_url.endswith(".CHECKSUM"):
-            return Response(f"{hashlib.sha256(payload).hexdigest()}  archive.zip\n".encode())
+            return Response(f"{expected}  file.zip\n".encode())
         return Response(payload)
 
-    path = tmp_path / "ETHUSDT_1m.csv"
-    result = download_klines(
-        "ETHUSDT",
-        "1m",
-        path,
-        "2020-01-01",
-        "2020-01-31",
-        opener=rest_opener,
-        archive_opener=archive_opener,
-        use_archives=True,
-    )
-    assert result == {
-        "path": str(path.resolve()),
-        "added": 2,
-        "total": 2,
-        "gaps": 0,
-        "archives": 1,
-        "rest_segments": 0,
-    }
-    assert path.read_text().splitlines()[1:] == [
-        "1577836800000,1,2,0.5,1.5,10",
-        "1577836860000,1,2,0.5,1.6,10",
-    ]
-    assert not path.with_name(f".{path.name}.parts").exists()
+    result = _download_one(task, tmp_path, verify=True, cancelled=lambda: False, opener=opener)
+    assert result.status == "downloaded"
+    path = tmp_path / task.relative_path
+    assert path.read_bytes() == payload
+
+    result2 = _download_one(task, tmp_path, verify=False, cancelled=lambda: False, opener=opener)
+    assert result2.status == "skipped"
 
 
-def test_missing_archive_automatically_falls_back_to_rest(tmp_path):
-    rows = [kline(1577836800000), kline(1577836860000)]
+def test_404_is_missing_not_failed(tmp_path):
+    task = plan_archive_tasks(
+        "BTCUSDT", ["metrics"], [], "2026-08-20", "2026-08-20", today=date(2026, 8, 21)
+    )[0]
 
-    def rest_opener(request, **_kwargs):
-        limit = parse_qs(urlparse(request.full_url).query)["limit"][0]
-        selected = [rows[0]] if limit == "1" else rows
-        return Response(json.dumps(selected).encode())
-
-    def missing_archive(request, **_kwargs):
+    def opener(request, **_kwargs):
         raise HTTPError(request.full_url, 404, "missing", {}, None)
 
-    path = tmp_path / "ETHUSDT_1m.csv"
-    result = download_klines(
-        "ETHUSDT",
-        "1m",
-        path,
-        "2020-01-01",
-        "2020-01-31",
-        opener=rest_opener,
-        archive_opener=missing_archive,
-        use_archives=True,
-    )
-    assert result["archives"] == 0
-    assert result["rest_segments"] == 1
-    assert result["total"] == 2
+    result = _download_one(task, tmp_path, verify=False, cancelled=lambda: False, opener=opener)
+    assert result.status == "missing"
 
 
-def test_pause_keeps_verified_parts_and_next_run_reuses_them(tmp_path):
-    rows = [kline(1577836800000), kline(1577836860000)]
-    payload = archive_payload(rows)
-    archive_requests = []
-    paused = {"value": False}
+def test_multi_symbol_collection_plans_in_one_run(tmp_path):
+    payload = b"PK" + b"z" * 32
 
-    def rest_opener(_request, **_kwargs):
-        return Response(json.dumps([rows[0]]).encode())
-
-    def archive_opener(request, **_kwargs):
-        archive_requests.append(request.full_url)
-        if request.full_url.endswith(".CHECKSUM"):
-            return Response(f"{hashlib.sha256(payload).hexdigest()}  archive.zip\n".encode())
+    def opener(request, **_kwargs):
         return Response(payload)
 
-    def progress(_count, detail):
-        if "verified archive" in detail:
-            paused["value"] = True
-
-    path = tmp_path / "ETHUSDT_1m.csv"
-    with pytest.raises(InterruptedError):
-        download_klines(
-            "ETHUSDT",
-            "1m",
-            path,
-            "2020-01-01",
-            "2020-01-31",
-            opener=rest_opener,
-            archive_opener=archive_opener,
-            use_archives=True,
-            progress=progress,
-            cancelled=lambda: paused["value"],
-        )
-    assert not path.exists()
-    assert path.with_name(f".{path.name}.parts").exists()
-    first_request_count = len(archive_requests)
-
-    paused["value"] = False
-    result = download_klines(
-        "ETHUSDT",
-        "1m",
-        path,
-        "2020-01-01",
-        "2020-01-31",
-        opener=rest_opener,
-        archive_opener=archive_opener,
-        use_archives=True,
+    summary = download_archive_library(
+        ["BTCUSDT", "ETHUSDT"],
+        ["metrics"],
+        [],
+        tmp_path,
+        "2026-08-20",
+        "2026-08-20",
+        workers=2,
+        verify=False,
+        opener=opener,
+        today=date(2026, 8, 21),
     )
-    assert result["total"] == 2
-    assert len(archive_requests) == first_request_count
-    assert not path.with_name(f".{path.name}.parts").exists()
-
-
-def test_existing_legacy_checkpoint_is_merged_on_upgrade(tmp_path):
-    path = tmp_path / "ETHUSDT_1m.csv"
-    checkpoint = path.with_name(f".{path.name}.download")
-    header = "timestamp,open,high,low,close,volume\n"
-    path.write_text(header + "1577836800000,1,2,0.5,1.5,10\n", encoding="utf-8")
-    checkpoint.write_text(header + "1577836860000,1,2,0.5,1.6,10\n", encoding="utf-8")
-
-    result = download_klines(
-        "ETHUSDT",
-        "1m",
-        path,
-        "2020-01-01",
-        "2020-01-01 00:01:00",
-        opener=lambda *_a, **_k: Response(b"[]"),
-    )
-    assert result["total"] == 2
-    assert result["added"] == 1
-    assert not checkpoint.exists()
-    assert path.read_text(encoding="utf-8").splitlines()[-1].startswith("1577836860000,")
-
-
-def test_progress_state_reports_completed_and_expected_candles(tmp_path):
-    rows = [kline(1577836800000), kline(1577836860000)]
-    updates = []
-
-    def rest_opener(request, **_kwargs):
-        return Response(json.dumps(rows).encode())
-
-    path = tmp_path / "BTCUSDT_1m.csv"
-    download_klines(
-        "BTCUSDT",
-        "1m",
-        path,
-        "2020-01-01 00:00:00",
-        "2020-01-01 00:01:00",
-        opener=rest_opener,
-        progress_state=lambda completed, total, detail: updates.append((completed, total, detail)),
-    )
-    assert updates
-    assert updates[-1][0:2] == (2, 2)
+    assert summary["planned"] == 2
+    assert summary["counts"]["downloaded"] == 2
+    assert {r.task.symbol for r in summary["results"]} == {"BTCUSDT", "ETHUSDT"}
