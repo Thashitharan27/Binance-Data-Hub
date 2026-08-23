@@ -153,6 +153,12 @@ def _download_single(task: ArchiveTask, final: Path, opener, gate: BoundedSemaph
                 result = DownloadResult(task, "missing", error="HTTP 404")
                 result.transport = "single"
                 return result
+            # A stale/full .part can legitimately receive 416 when the old run
+            # had already downloaded the final byte but stopped before publish.
+            # If it was not a valid ZIP, discard it and retry cleanly.
+            if exc.code == 416 and resume_from:
+                part.unlink(missing_ok=True)
+                continue
             if exc.code not in (418, 429, 500, 502, 503, 504) or attempt == retries - 1:
                 result = DownloadResult(task, "failed", part.stat().st_size if part.exists() else 0, error=f"HTTP {exc.code}")
                 result.transport = "single"
@@ -329,20 +335,75 @@ def _finalize_download(result: DownloadResult, final: Path, task: ArchiveTask, v
     return result
 
 
+def _recover_complete_part(task: ArchiveTask, final: Path, verify: bool, opener) -> DownloadResult | None:
+    """Publish a valid .part left behind after body download completed.
+
+    A process can stop after the final byte is written but before os.replace()
+    publishes the ZIP. Re-downloading that file is unnecessary. In verify mode,
+    the official Binance checksum must still match before promotion.
+    """
+    part = final.with_name(f"{final.name}.part")
+    if not part.exists() or not part.stat().st_size or not zipfile.is_zipfile(part):
+        return None
+
+    digest = None
+    if verify:
+        expected = _fetch_checksum(task, opener)
+        if expected is None:
+            result = DownloadResult(task, "failed", part.stat().st_size, error="checksum file is missing")
+            result.transport = "recovered-part"
+            return result
+        digest = _sha256(part)
+        if digest != expected:
+            part.unlink(missing_ok=True)
+            return None
+
+    os.replace(part, final)
+    shutil.rmtree(final.with_name(f".{final.name}.segments"), ignore_errors=True)
+    result = DownloadResult(task, "skipped", final.stat().st_size, digest)
+    result.transport = "recovered-part"
+    return result
+
+
 def _download_adaptive(task: ArchiveTask, root: Path, *, verify: bool, cancelled, opener, gate: BoundedSemaphore, max_segments: int, segment_threshold_bytes: int, on_bytes=None) -> DownloadResult:
     final = root / task.relative_path
     final.parent.mkdir(parents=True, exist_ok=True)
+    part = final.with_name(f"{final.name}.part")
 
     if final.exists() and final.stat().st_size > 0:
-        if not verify:
+        if not zipfile.is_zipfile(final):
+            final.unlink(missing_ok=True)
+        elif not verify:
             result = DownloadResult(task, "skipped", final.stat().st_size)
             result.transport = "existing"
             return result
-        expected = _fetch_checksum(task, opener)
-        if expected and _sha256(final) == expected:
-            result = DownloadResult(task, "skipped", final.stat().st_size, expected)
-            result.transport = "existing"
-            return result
+        else:
+            expected = _fetch_checksum(task, opener)
+            if expected and _sha256(final) == expected:
+                result = DownloadResult(task, "skipped", final.stat().st_size, expected)
+                result.transport = "existing"
+                return result
+            if expected:
+                final.unlink(missing_ok=True)
+
+    recovered = _recover_complete_part(task, final, verify, opener)
+    if recovered is not None:
+        return recovered
+
+    # Prefer resuming an existing combined .part before starting segmented
+    # transport. This preserves already-downloaded bytes from an interrupted run.
+    if part.exists() and part.stat().st_size > 0:
+        resumed = _download_single(task, final, opener, gate, cancelled, on_bytes)
+        if resumed.status == "downloaded":
+            finalized = _finalize_download(resumed, final, task, verify, opener)
+            if finalized.status != "failed":
+                return finalized
+            # Invalid ZIP/checksum finalization deletes the bad .part. When that
+            # happened, continue below and perform one clean download now.
+            if part.exists():
+                return finalized
+        else:
+            return resumed
 
     if _eligible_for_segmentation(task) and max_segments > 1:
         total_size, accepts_ranges = _probe_range_support(task, opener, gate)
@@ -476,6 +537,9 @@ def download_archive_library(
         for item in results
         if item.status == "downloaded" and str(getattr(item, "transport", "")).startswith("segmented-")
     )
+    recovered_parts = sum(
+        1 for item in results if str(getattr(item, "transport", "")) == "recovered-part"
+    )
     total_processed_target = len(tasks) + len(fallbacks)
     performance = meter.finish(len(results), total_processed_target)
     summary = {
@@ -486,6 +550,7 @@ def download_archive_library(
         "bytes_downloaded": sum(item.bytes for item in results if item.status == "downloaded"),
         "counts": counts,
         "segmented_files": segmented_files,
+        "recovered_parts": recovered_parts,
         "performance": performance,
         "max_connections": max_connections,
         "segments": segments,
