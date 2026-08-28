@@ -15,7 +15,7 @@ The exact continuity scanner supports fixed UTC kline intervals from `1m` throug
 
 ## What the scanner checks
 
-The repair scanner now checks both **continuity** and basic **kline integrity**:
+The repair scanner checks both **continuity** and basic **kline integrity**:
 
 - every expected fixed-interval candle timestamp is present;
 - timestamps sit on the expected UTC interval grid;
@@ -34,14 +34,17 @@ The repair path preserves Binance's official raw files and chooses the smallest 
 - a missing or unreadable/corrupt local monthly ZIP is downloaded once as a monthly archive;
 - a valid monthly ZIP with internal candle gaps is **not** re-downloaded;
 - a valid monthly ZIP containing an invalid candle value is also **not** edited or re-downloaded just to rewrite that row;
-- remaining missing **or invalid** UTC days are repaired using only the relevant Binance daily ZIPs;
+- remaining missing **or invalid** UTC days are repaired using only the relevant Binance daily kline ZIPs;
 - monthly and daily rows are combined logically during scans, with daily rows taking precedence for matching timestamps, so a daily repair can replace one bad monthly row without modifying the monthly archive;
-- if Binance's daily archive is unavailable, the download fails, or the daily source contains the same invalid candle, the issue remains visible as unresolved instead of being silently synthesized.
+- for unresolved Contract-kline volume-family anomalies that remain invalid in the daily kline, Data Repair can automatically fetch only the affected UTC day's `daily/aggTrades` archive and attempt a verified reconstruction;
+- if the aggTrades proof requirements do not reconcile, the candle remains invalid rather than being silently synthesized.
 
 Repair downloads are recorded in the existing `manifest.sqlite`.
+
+See [Verified kline repair](verified_kline_repair.md) for the aggTrades reconstruction proof and provenance rules.
 
 ## Example
 
 If Strategy Lab reports five missing `1d` candles and 7,200 missing `1m` candles over the same range, the scanner can identify the exact UTC days. Since `5 × 1,440 = 7,200`, this commonly indicates five complete missing UTC days rather than random individual minute gaps.
 
-If Strategy Lab instead reports a present candle such as `TAKER_VOLUME_EXCEEDS_TOTAL` at `2023-11-30 12:35 UTC`, Data Repair marks that UTC day as invalid. **Scan & Repair** then requests the Binance daily archive for that day and uses the daily row as the logical repair source if it is valid.
+If Strategy Lab instead reports a present candle such as `TAKER_VOLUME_EXCEEDS_TOTAL` at `2023-11-30 12:35 UTC`, Data Repair first requests the Binance daily kline for that day. If that daily row is also invalid, the verified repair fallback can use that day's aggTrades evidence without modifying the original Binance archives.

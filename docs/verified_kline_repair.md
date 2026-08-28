@@ -1,6 +1,6 @@
 # Verified kline repair from daily aggTrades
 
-Data Repair keeps Binance's official monthly and daily kline ZIPs immutable. When an ordinary daily-kline repair still contains a narrow volume-family integrity error, the GUI now has a final evidence-based fallback for **Contract klines**.
+Data Repair keeps Binance's official monthly and daily kline ZIPs immutable. When an ordinary daily-kline repair still contains a narrow volume-family integrity error, the GUI has a final evidence-based fallback for **Contract klines**.
 
 ## Automatic fallback
 
@@ -25,7 +25,7 @@ The overlay ZIP contains only reconstructed timestamps plus `repair_manifest.jso
 
 The original Binance monthly kline, daily kline and aggTrades archives are never edited.
 
-Crypto Strategy Lab's existing overlapping-source repair policy can consume the valid later overlay while retaining the invalid source rows for provenance.
+Crypto Strategy Lab's overlapping-source repair policy can consume the valid later overlay while retaining the invalid source rows for provenance.
 
 ## Why aggTrades is not in the Data Repair dropdown
 
