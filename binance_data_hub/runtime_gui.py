@@ -115,7 +115,7 @@ class RepairWorker(QObject):
             "scan-before": (0, 20, "Initial scan"),
             "repair-monthly": (20, 45, "Repairing monthly archive"),
             "scan-middle": (45, 60, "Checking monthly repair"),
-            "repair-daily": (60, 85, "Repairing missing UTC day"),
+            "repair-daily": (60, 85, "Repairing affected UTC day"),
             "scan-after": (85, 99, "Verifying repaired range"),
         }
         low, high, label = ranges.get(stage, (0, 99, stage))
@@ -208,9 +208,10 @@ class RuntimeMainWindow(ResponsiveMainWindow):
         repair_box = QGroupBox("Data Repair — on demand only")
         repair_layout = QVBoxLayout(repair_box)
         repair_note = QLabel(
-            "Use this only when Strategy Lab reports missing candles. It scans the selected local range "
-            "only; normal Collect / Update Archives runs never open CSVs or perform continuity scans. "
-            "Scan & Repair keeps valid monthly ZIPs intact and uses daily Binance archives to fill internal gaps."
+            "Use this only when Strategy Lab reports missing or invalid candles. It scans the selected local "
+            "range only; normal Collect / Update Archives runs never open CSVs or perform continuity/integrity "
+            "scans. Scan & Repair keeps valid monthly ZIPs intact and uses targeted daily Binance archives to "
+            "fill missing candles or replace invalid monthly rows."
         )
         repair_note.setWordWrap(True)
         repair_layout.addWidget(repair_note)
@@ -238,9 +239,11 @@ class RuntimeMainWindow(ResponsiveMainWindow):
         repair_actions = QHBoxLayout()
         self.repair_scan_btn = QPushButton("Scan Range")
         self.repair_fix_btn = QPushButton("Scan & Repair")
-        self.repair_scan_btn.setToolTip("Read only the selected local ZIPs and report exact candle gaps. Downloads nothing.")
+        self.repair_scan_btn.setToolTip(
+            "Read only the selected local ZIPs and report missing candles plus blocking kline integrity errors. Downloads nothing."
+        )
         self.repair_fix_btn.setToolTip(
-            "Scan first, then download only the smallest useful repair archives and scan again."
+            "Scan first, then download only the smallest useful monthly/daily repair archives and scan again."
         )
         self.repair_scan_btn.clicked.connect(lambda: self.start_repair_operation(False))
         self.repair_fix_btn.clicked.connect(lambda: self.start_repair_operation(True))
@@ -253,8 +256,8 @@ class RuntimeMainWindow(ResponsiveMainWindow):
         self.repair_summary.setWordWrap(True)
         repair_layout.addWidget(self.repair_summary)
         self.repair_table = QTableWidget(0, 4)
-        self.repair_table.setHorizontalHeaderLabels(["UTC day", "Missing candles", "Repair source", "Status"])
-        self.repair_table.setMaximumHeight(150)
+        self.repair_table.setHorizontalHeaderLabels(["UTC day", "Missing / invalid", "Repair source", "Status"])
+        self.repair_table.setMaximumHeight(180)
         repair_layout.addWidget(self.repair_table)
 
         # Keep repair next to the collection controls but fully separate from the
@@ -355,7 +358,9 @@ class RuntimeMainWindow(ResponsiveMainWindow):
         self.progress.setValue(0)
         self.repair_table.setRowCount(0)
         self.repair_summary.setText(
-            "Scanning and repairing only this range..." if repair else "Scanning only this local range; nothing will be downloaded..."
+            "Scanning and repairing only this range..."
+            if repair
+            else "Scanning only this local range for missing/invalid candles; nothing will be downloaded..."
         )
         self.status.setText(self.repair_summary.text())
 
@@ -379,6 +384,16 @@ class RuntimeMainWindow(ResponsiveMainWindow):
         self.worker.failed.connect(self.thread.quit)
         self.thread.start()
 
+    @staticmethod
+    def _integrity_codes_by_day(scan):
+        result = {}
+        for detail in scan.get("integrity_issues", []):
+            day = detail.get("day")
+            if not day:
+                continue
+            result.setdefault(day, set()).update(str(code) for code in detail.get("codes", []))
+        return result
+
     def repair_done(self, summary):
         self.set_busy(False)
         self.operation = None
@@ -395,28 +410,58 @@ class RuntimeMainWindow(ResponsiveMainWindow):
             before = summary.get("before", {})
             after = summary.get("after", {})
 
+        before_missing = before.get("missing_by_day", {})
+        before_invalid = before.get("invalid_by_day", {})
+        after_missing = after.get("missing_by_day", {})
+        after_invalid = after.get("invalid_by_day", {})
+        codes_by_day = self._integrity_codes_by_day(after)
+
         if mode == "repair":
-            days = sorted(set(before.get("missing_by_day", {})) | set(after.get("missing_by_day", {})))
+            days = sorted(
+                set(before_missing)
+                | set(before_invalid)
+                | set(after_missing)
+                | set(after_invalid)
+            )
             source_missing = set(summary.get("source_missing_days", []))
             failed = set(summary.get("failed_days", []))
-            after_missing = after.get("missing_by_day", {})
             rows = []
             for day in days:
-                remaining = int(after_missing.get(day, 0))
-                if remaining == 0:
+                remaining_missing = int(after_missing.get(day, 0))
+                remaining_invalid = int(after_invalid.get(day, 0))
+                remaining = f"{remaining_missing:,} / {remaining_invalid:,}"
+                codes = ", ".join(sorted(codes_by_day.get(day, ())))
+                if remaining_missing == 0 and remaining_invalid == 0:
                     status = "Repaired"
                 elif day in source_missing:
                     status = "Binance daily archive unavailable"
                 elif day in failed:
                     status = "Repair download failed"
-                else:
+                elif remaining_missing and remaining_invalid:
+                    status = "Still missing + invalid after repair"
+                elif remaining_missing:
                     status = "Still missing after repair"
+                else:
+                    status = "Still invalid after repair"
+                if codes:
+                    status += f" · {codes}"
                 rows.append((day, remaining, "monthly/daily targeted repair", status))
         else:
-            rows = [
-                (day, count, "not attempted", "Missing")
-                for day, count in after.get("missing_by_day", {}).items()
-            ]
+            days = sorted(set(after_missing) | set(after_invalid))
+            rows = []
+            for day in days:
+                missing = int(after_missing.get(day, 0))
+                invalid = int(after_invalid.get(day, 0))
+                codes = ", ".join(sorted(codes_by_day.get(day, ())))
+                if missing and invalid:
+                    status = "Missing + invalid"
+                elif missing:
+                    status = "Missing"
+                else:
+                    status = "Invalid"
+                if codes:
+                    status += f" · {codes}"
+                rows.append((day, f"{missing:,} / {invalid:,}", "not attempted", status))
 
         self.repair_table.setRowCount(len(rows))
         for row_index, values in enumerate(rows):
@@ -424,35 +469,49 @@ class RuntimeMainWindow(ResponsiveMainWindow):
                 self.repair_table.setItem(row_index, col, QTableWidgetItem(str(value)))
         self.repair_table.resizeColumnsToContents()
 
-        invalid = len(after.get("invalid_archives", []))
+        invalid_archives = len(after.get("invalid_archives", []))
         duplicates = int(after.get("archive_duplicates", 0))
+        issue_counts = after.get("integrity_issue_counts", {})
+        issue_summary = ", ".join(
+            f"{code}: {int(count):,}" for code, count in sorted(issue_counts.items())
+        ) or "none"
+
         if mode == "repair":
             self.repair_summary.setText(
                 f"Before: {before.get('missing_candles', 0):,} missing candles across "
-                f"{before.get('missing_days', 0):,} UTC days. After repair: "
-                f"{after.get('missing_candles', 0):,} missing across {after.get('missing_days', 0):,} days. "
+                f"{before.get('missing_days', 0):,} UTC days; "
+                f"{before.get('invalid_candles', 0):,} invalid candles across "
+                f"{before.get('invalid_days', 0):,} days. After repair: "
+                f"{after.get('missing_candles', 0):,} missing across {after.get('missing_days', 0):,} days; "
+                f"{after.get('invalid_candles', 0):,} invalid across {after.get('invalid_days', 0):,} days. "
                 f"Monthly repair attempts: {summary.get('monthly_repairs', 0):,}; "
                 f"daily repair attempts: {summary.get('daily_repairs', 0):,}. "
-                f"Invalid local archives remaining: {invalid:,}; duplicate rows inside individual archives: {duplicates:,}."
+                f"Integrity issues remaining: {issue_summary}. "
+                f"Invalid local archives remaining: {invalid_archives:,}; "
+                f"duplicate rows inside individual archives: {duplicates:,}."
             )
         else:
             self.repair_summary.setText(
                 f"Expected {after.get('expected_candles', 0):,} candles; found {after.get('found_candles', 0):,}; "
-                f"missing {after.get('missing_candles', 0):,} across {after.get('missing_days', 0):,} UTC days. "
+                f"missing {after.get('missing_candles', 0):,} across {after.get('missing_days', 0):,} UTC days; "
+                f"invalid {after.get('invalid_candles', 0):,} across {after.get('invalid_days', 0):,} days. "
+                f"Integrity issues: {issue_summary}. "
                 f"Scanned {after.get('archives_scanned', 0):,} local archives. "
-                f"Invalid archives: {invalid:,}; duplicate rows inside individual archives: {duplicates:,}."
+                f"Invalid archives: {invalid_archives:,}; duplicate rows inside individual archives: {duplicates:,}."
             )
 
         if after.get("complete"):
             self.status.setText("Data Repair check complete — selected range is healthy.")
         elif mode == "repair":
             self.status.setText(
-                f"Repair finished — {after.get('missing_candles', 0):,} candles remain missing. "
-                "Review the UTC-day table for Binance source gaps or failed downloads."
+                f"Repair finished — {after.get('missing_candles', 0):,} candles remain missing and "
+                f"{after.get('invalid_candles', 0):,} remain invalid. "
+                "Review the UTC-day table for Binance source gaps, integrity errors, or failed downloads."
             )
         else:
             self.status.setText(
-                f"Scan complete — {after.get('missing_candles', 0):,} missing candles found."
+                f"Scan complete — {after.get('missing_candles', 0):,} missing and "
+                f"{after.get('invalid_candles', 0):,} invalid candles found."
             )
         self.progress.setValue(100)
         QApplication.beep()

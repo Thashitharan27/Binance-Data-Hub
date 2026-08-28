@@ -1,15 +1,16 @@
-"""On-demand kline coverage scanner and targeted repair tools.
+"""On-demand kline coverage and integrity scanner with targeted repair tools.
 
 This module is intentionally separate from normal archive collection. Nothing in
 ``download_archive_library`` calls it, so the Hub's speed-first download path
-never pays the cost of opening CSVs or checking candle continuity.
+never pays the cost of opening CSVs or checking candle continuity/integrity.
 """
 from __future__ import annotations
 
 import csv
 import io
+import math
 import zipfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -49,6 +50,7 @@ INTERVAL_MILLISECONDS = {
 }
 
 DEFAULT_REPAIR_WORKERS = 16
+MAX_INTEGRITY_DETAILS = 100
 
 
 @dataclass(frozen=True)
@@ -79,7 +81,7 @@ def _validate_request(symbol: str, dataset: str, interval: str, start_date, end_
     symbol = _normalize_symbol(symbol)
     if dataset not in KLINE_DATASETS:
         raise ValueError(
-            "Data Repair continuity scanning currently supports kline datasets only: "
+            "Data Repair scanning currently supports kline datasets only: "
             + ", ".join(KLINE_DATASETS)
         )
     if interval not in INTERVAL_MILLISECONDS:
@@ -142,6 +144,10 @@ def _archive_candidates(root: Path, dataset: str, symbol: str, interval: str, st
             candidates.append(_ArchiveCandidate(path, "daily", day.isoformat(), day, day))
         day += timedelta(days=1)
 
+    # Monthly is intentionally read before daily. The scanner stores the last
+    # row seen for each timestamp, mirroring Strategy Lab's repair-source
+    # precedence: a targeted daily archive can replace one bad/missing monthly
+    # candle without modifying the official monthly ZIP.
     candidates.sort(key=lambda item: (item.span_start, 0 if item.period == "monthly" else 1, item.key))
     return candidates
 
@@ -158,15 +164,121 @@ def _normalize_epoch_ms(raw: str) -> int | None:
     return value
 
 
-def _read_archive_timestamps(candidate: _ArchiveCandidate, range_start_ms: int, range_end_ms: int):
+def _number(row, index: int) -> float | None:
+    if index >= len(row):
+        return None
+    raw = str(row[index]).strip()
+    if raw == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return math.nan
+    return value
+
+
+def _kline_integrity_issues(row, dataset: str, timestamp: int, interval_ms: int) -> tuple[dict, ...]:
+    """Return row-level issues that can make a present candle unsafe to consume.
+
+    The checks intentionally mirror Strategy Lab's blocking kline invariants while
+    staying tolerant of older/minimal archive schemas where optional Binance
+    fields are absent. They do not synthesize or modify source values.
+    """
+    issues: list[dict] = []
+
+    def add(code: str, message: str, **details):
+        issues.append({"code": code, "message": message, "details": details})
+
+    if timestamp % interval_ms != 0:
+        add("OFF_GRID_TIMESTAMP", "Candle timestamp is off the expected UTC interval grid")
+
+    if len(row) < 6:
+        add("KLINE_SCHEMA_TOO_SHORT", "Kline row has fewer than the six required OHLCV columns")
+        return tuple(issues)
+
+    open_, high, low, close, volume = (_number(row, index) for index in range(1, 6))
+    required = {"open": open_, "high": high, "low": low, "close": close, "volume": volume}
+    for name, value in required.items():
+        if value is None or not math.isfinite(value):
+            add("INVALID_NUMERIC", f"{name} must be a finite number", field=name)
+
+    if any(value is None or not math.isfinite(value) for value in (open_, high, low, close, volume)):
+        return tuple(issues)
+
+    if dataset != "premiumIndexKlines":
+        for name, value in (("open", open_), ("high", high), ("low", low), ("close", close)):
+            if value <= 0:
+                add("INVALID_DOMAIN_VALUE", f"{name} must be positive", field=name, value=value)
+    if volume < 0:
+        add("INVALID_DOMAIN_VALUE", "volume must be non-negative", field="volume", value=volume)
+
+    if low > high or open_ < low or open_ > high or close < low or close > high:
+        add("INVALID_OHLC", "OHLC values violate candle bounds")
+
+    optional_names = {
+        7: "quote_volume",
+        8: "trade_count",
+        9: "taker_buy_base_volume",
+        10: "taker_buy_quote_volume",
+    }
+    optional: dict[str, float | None] = {}
+    for index, name in optional_names.items():
+        value = _number(row, index)
+        optional[name] = value
+        if value is None:
+            continue
+        if not math.isfinite(value):
+            add("INVALID_NUMERIC", f"{name} must be finite when present", field=name)
+        elif value < 0:
+            add("INVALID_DOMAIN_VALUE", f"{name} must be non-negative", field=name, value=value)
+
+    taker_base = optional.get("taker_buy_base_volume")
+    if taker_base is not None and math.isfinite(taker_base):
+        tolerance = max(abs(volume) * 1e-12, 1e-12)
+        if taker_base > volume + tolerance:
+            add(
+                "TAKER_VOLUME_EXCEEDS_TOTAL",
+                "taker_buy_base_volume exceeds volume",
+                total=volume,
+                taker=taker_base,
+            )
+
+    quote_volume = optional.get("quote_volume")
+    taker_quote = optional.get("taker_buy_quote_volume")
+    if (
+        quote_volume is not None
+        and taker_quote is not None
+        and math.isfinite(quote_volume)
+        and math.isfinite(taker_quote)
+    ):
+        tolerance = max(abs(quote_volume) * 1e-12, 1e-12)
+        if taker_quote > quote_volume + tolerance:
+            add(
+                "TAKER_QUOTE_VOLUME_EXCEEDS_TOTAL",
+                "taker_buy_quote_volume exceeds quote_volume",
+                total=quote_volume,
+                taker=taker_quote,
+            )
+
+    return tuple(issues)
+
+
+def _read_archive_candles(
+    candidate: _ArchiveCandidate,
+    dataset: str,
+    interval_ms: int,
+    range_start_ms: int,
+    range_end_ms: int,
+):
     timestamps: set[int] = set()
+    candle_issues: dict[int, tuple[dict, ...]] = {}
     duplicates = 0
     rows = 0
     try:
         with zipfile.ZipFile(candidate.path) as archive:
             csv_members = [name for name in archive.namelist() if name.lower().endswith(".csv")]
             if not csv_members:
-                return timestamps, duplicates, rows, "ZIP contains no CSV file", True
+                return timestamps, candle_issues, duplicates, rows, "ZIP contains no CSV file", True
             for name in csv_members:
                 with archive.open(name) as raw:
                     text = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
@@ -178,7 +290,7 @@ def _read_archive_timestamps(candidate: _ArchiveCandidate, range_start_ms: int, 
                         timestamp = _normalize_epoch_ms(row[0])
                         if timestamp is None:
                             # Header rows are allowed; a non-numeric first column
-                            # elsewhere is harmless for coverage and is ignored.
+                            # elsewhere cannot be placed on the timeline and is ignored.
                             continue
                         rows += 1
                         if range_start_ms <= timestamp <= range_end_ms:
@@ -186,15 +298,24 @@ def _read_archive_timestamps(candidate: _ArchiveCandidate, range_start_ms: int, 
                                 duplicates += 1
                             local_seen.add(timestamp)
                             timestamps.add(timestamp)
+                            # Last row wins inside an archive, matching the canonical
+                            # kline adapter's duplicate resolution.
+                            candle_issues[timestamp] = _kline_integrity_issues(
+                                row, dataset, timestamp, interval_ms
+                            )
         if rows == 0:
-            return timestamps, duplicates, rows, "CSV contains no timestamp rows", True
-        return timestamps, duplicates, rows, None, True
+            return timestamps, candle_issues, duplicates, rows, "CSV contains no timestamp rows", True
+        return timestamps, candle_issues, duplicates, rows, None, True
     except (OSError, UnicodeError, csv.Error, zipfile.BadZipFile, RuntimeError) as exc:
-        return timestamps, duplicates, rows, str(exc), zipfile.is_zipfile(candidate.path)
+        return timestamps, candle_issues, duplicates, rows, str(exc), zipfile.is_zipfile(candidate.path)
 
 
 def _day_from_ms(timestamp_ms: int) -> str:
     return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).date().isoformat()
+
+
+def _iso_from_ms(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).isoformat()
 
 
 def scan_kline_range(
@@ -208,11 +329,11 @@ def scan_kline_range(
     progress=None,
     cancelled=None,
 ) -> dict:
-    """Scan only the requested local kline range and report exact candle gaps.
+    """Scan a local kline range for both continuity and row integrity.
 
-    The scanner opens existing monthly/daily ZIPs but never downloads anything.
-    Monthly and daily timestamps are unioned logically, so daily repair archives
-    can supplement an incomplete official monthly archive without modifying it.
+    Monthly and daily rows are combined logically. Daily rows take precedence for
+    the same timestamp, so a targeted daily repair can replace a bad monthly row
+    while the official monthly ZIP remains byte-for-byte untouched.
     """
     symbol, dataset, interval, start, end = _validate_request(
         symbol, dataset, interval, start_date, end_date
@@ -227,6 +348,7 @@ def scan_kline_range(
 
     candidates = _archive_candidates(root, dataset, symbol, interval, start, end)
     logical_timestamps: set[int] = set()
+    effective_integrity: dict[int, dict] = {}
     archive_duplicates = 0
     invalid_archives = []
     archives = []
@@ -241,17 +363,26 @@ def scan_kline_range(
                 "start_date": start.isoformat(),
                 "end_date": end.isoformat(),
             }
-        timestamps, duplicates, rows, error, valid_zip = _read_archive_timestamps(
-            candidate, range_start_ms, range_end_ms
+        timestamps, candle_issues, duplicates, rows, error, valid_zip = _read_archive_candles(
+            candidate, dataset, interval_ms, range_start_ms, range_end_ms
         )
         logical_timestamps.update(timestamps)
+        for timestamp in timestamps:
+            effective_integrity[timestamp] = {
+                "issues": candle_issues.get(timestamp, ()),
+                "source_period": candidate.period,
+                "source_key": candidate.key,
+                "source_path": str(candidate.path),
+            }
         archive_duplicates += duplicates
+        invalid_in_archive = sum(1 for issues in candle_issues.values() if issues)
         archive_info = {
             "path": str(candidate.path),
             "period": candidate.period,
             "key": candidate.key,
             "rows": rows,
             "candles_in_range": len(timestamps),
+            "invalid_candles": invalid_in_archive,
             "duplicates": duplicates,
             "error": error,
             "valid_zip": valid_zip,
@@ -275,8 +406,35 @@ def scan_kline_range(
             missing_by_day[_day_from_ms(timestamp)] += 1
         timestamp += interval_ms
 
+    invalid_by_day: dict[str, int] = defaultdict(int)
+    issue_counts: Counter[str] = Counter()
+    integrity_issues = []
+    invalid_candle_count = 0
+    for timestamp, state in sorted(effective_integrity.items()):
+        issues = tuple(state.get("issues") or ())
+        if not issues:
+            continue
+        invalid_candle_count += 1
+        day = _day_from_ms(timestamp)
+        invalid_by_day[day] += 1
+        for issue in issues:
+            issue_counts[str(issue.get("code", "UNKNOWN"))] += 1
+        if len(integrity_issues) < MAX_INTEGRITY_DETAILS:
+            integrity_issues.append(
+                {
+                    "timestamp": _iso_from_ms(timestamp),
+                    "day": day,
+                    "codes": [issue.get("code", "UNKNOWN") for issue in issues],
+                    "issues": list(issues),
+                    "source_period": state.get("source_period"),
+                    "source_key": state.get("source_key"),
+                    "source_path": state.get("source_path"),
+                }
+            )
+
     found_expected = expected_count - missing_count
     missing_by_day = dict(sorted(missing_by_day.items()))
+    invalid_by_day = dict(sorted(invalid_by_day.items()))
     return {
         "cancelled": False,
         "symbol": symbol,
@@ -289,11 +447,21 @@ def scan_kline_range(
         "missing_candles": missing_count,
         "missing_days": len(missing_by_day),
         "missing_by_day": missing_by_day,
+        "invalid_candles": invalid_candle_count,
+        "invalid_days": len(invalid_by_day),
+        "invalid_by_day": invalid_by_day,
+        "integrity_issue_counts": dict(sorted(issue_counts.items())),
+        "integrity_issues": integrity_issues,
+        "integrity_details_truncated": invalid_candle_count > len(integrity_issues),
         "archive_duplicates": archive_duplicates,
         "archives_scanned": len(candidates),
         "invalid_archives": invalid_archives,
         "archives": archives,
-        "complete": missing_count == 0 and not invalid_archives,
+        "complete": (
+            missing_count == 0
+            and invalid_candle_count == 0
+            and not invalid_archives
+        ),
     }
 
 
@@ -301,7 +469,8 @@ def _monthly_repair_tasks(root: Path, scan: dict, today: date) -> list[ArchiveTa
     """Prefer one monthly download when an entire local monthly source is absent/corrupt.
 
     A valid existing monthly ZIP is never re-downloaded merely because its CSV has
-    internal candle gaps; those gaps are repaired with daily archives instead.
+    internal candle gaps or a bad candle value; those are repaired with daily
+    archives instead.
     """
     dataset = scan["dataset"]
     symbol = scan["symbol"]
@@ -355,8 +524,12 @@ def _daily_repair_tasks(scan: dict) -> list[ArchiveTask]:
     spec = DATASETS[scan["dataset"]]
     if not spec.daily:
         return []
+    repair_days = sorted(
+        set(scan.get("missing_by_day", {}))
+        | set(scan.get("invalid_by_day", {}))
+    )
     tasks = []
-    for day_text in scan.get("missing_by_day", {}):
+    for day_text in repair_days:
         day = date.fromisoformat(day_text)
         tasks.append(
             _task(spec, scan["symbol"], "daily", day_text, scan["interval"], day, day)
@@ -426,13 +599,14 @@ def scan_and_repair_kline_range(
     cancelled=None,
     opener=None,
 ) -> dict:
-    """Scan a requested range, repair only what is missing, then verify again.
+    """Scan a requested range, repair missing/invalid candles, then verify again.
 
     Repair order is deliberately conservative:
     1. Missing/corrupt local monthly ZIP -> fetch that monthly ZIP once.
     2. Re-scan.
-    3. Valid monthly ZIP with internal gaps -> fetch only missing daily ZIPs.
-    4. Re-scan and report unresolved/upstream gaps.
+    3. Valid monthly ZIP with missing or invalid candles -> fetch only the affected
+       Binance daily ZIPs. Daily rows logically override monthly rows.
+    4. Re-scan and report unresolved/upstream source problems.
     """
     root = Path(root).resolve()
     symbol, dataset, interval, start, end = _validate_request(
@@ -521,7 +695,10 @@ def scan_and_repair_kline_range(
             if result.status in {"failed", "cancelled"}
         }
     )
-    unresolved_days = sorted(after.get("missing_by_day", {}))
+    unresolved_days = sorted(
+        set(after.get("missing_by_day", {}))
+        | set(after.get("invalid_by_day", {}))
+    )
 
     return {
         "cancelled": after.get("cancelled", False),
