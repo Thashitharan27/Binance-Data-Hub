@@ -175,6 +175,8 @@ class RuntimeMainWindow(ResponsiveMainWindow):
 
     def __init__(self):
         super().__init__()
+        self._pending_repair_result = None
+        self._pending_repair_error = None
 
         scroll = self.centralWidget()
         content = scroll.widget()
@@ -351,6 +353,13 @@ class RuntimeMainWindow(ResponsiveMainWindow):
         request = self._repair_request()
         if request is None:
             return
+        if self.thread is not None and self.thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Operation still finishing",
+                "Wait for the current Data Hub operation to finish before starting another repair scan.",
+            )
+            return
         symbol, dataset, interval, start, end = request
 
         self.operation = "repair-fix" if repair else "repair-scan"
@@ -363,9 +372,11 @@ class RuntimeMainWindow(ResponsiveMainWindow):
             else "Scanning only this local range for missing/invalid candles; nothing will be downloaded..."
         )
         self.status.setText(self.repair_summary.text())
+        self._pending_repair_result = None
+        self._pending_repair_error = None
 
-        self.thread = QThread(self)
-        self.worker = RepairWorker(
+        thread = QThread(self)
+        worker = RepairWorker(
             symbol,
             dataset,
             interval,
@@ -375,14 +386,46 @@ class RuntimeMainWindow(ResponsiveMainWindow):
             self.connections.value(),
             self.verify.isChecked(),
         )
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.status.connect(self.set_status)
-        self.worker.finished.connect(self.repair_done)
-        self.worker.failed.connect(self.failed)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.failed.connect(self.thread.quit)
-        self.thread.start()
+        self.thread = thread
+        self.worker = worker
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.status.connect(self.set_status)
+        worker.finished.connect(self._repair_worker_succeeded)
+        worker.failed.connect(self._repair_worker_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(self._repair_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _repair_worker_succeeded(self, summary):
+        # Do not repaint or re-enable the GUI while the worker thread is still
+        # unwinding. Store the result and render it only after QThread.finished.
+        self._pending_repair_result = summary
+
+    def _repair_worker_failed(self, detail):
+        self._pending_repair_error = detail
+
+    def _repair_thread_finished(self):
+        # The worker thread is now fully stopped, so it is safe to update the
+        # backing store, clear object references and allow another operation.
+        summary = self._pending_repair_result
+        error = self._pending_repair_error
+        self._pending_repair_result = None
+        self._pending_repair_error = None
+        self.worker = None
+        self.thread = None
+
+        if error is not None:
+            self.failed(error)
+            return
+        if summary is None:
+            self.failed("Data Repair worker stopped without returning a result.")
+            return
+        self.repair_done(summary)
 
     @staticmethod
     def _integrity_codes_by_day(scan):
