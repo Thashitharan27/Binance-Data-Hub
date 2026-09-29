@@ -59,17 +59,31 @@ class _RangeUnsupported(RuntimeError):
     pass
 
 
-def _network_call(gate: BoundedSemaphore):
+def _network_call(gate: BoundedSemaphore, meter: TransferMeter | None = None):
     class _Permit:
         def __enter__(self):
             gate.acquire()
+            if meter:
+                meter.connection_started()
             return self
 
         def __exit__(self, *_):
+            if meter:
+                meter.connection_finished()
             gate.release()
             return False
 
     return _Permit()
+
+
+def _with_file_activity(meter: TransferMeter | None, mode: str, func, *args, **kwargs):
+    if meter:
+        meter.file_started(mode)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        if meter:
+            meter.file_finished(mode)
 
 
 def _eligible_for_segmentation(task: ArchiveTask) -> bool:
@@ -80,11 +94,11 @@ def _eligible_for_segmentation(task: ArchiveTask) -> bool:
     return task.interval in {"1m", "3m", "5m"}
 
 
-def _probe_range_support(task: ArchiveTask, opener, gate: BoundedSemaphore) -> tuple[int | None, bool]:
+def _probe_range_support(task: ArchiveTask, opener, gate: BoundedSemaphore, meter: TransferMeter | None = None) -> tuple[int | None, bool]:
     """Return (content_length, accepts_ranges) without downloading the body."""
     request = Request(task.url, method="HEAD", headers={"User-Agent": USER_AGENT})
     try:
-        with _network_call(gate):
+        with _network_call(gate, meter):
             with opener(request, timeout=30) as response:
                 headers = getattr(response, "headers", {}) or {}
                 raw_length = headers.get("Content-Length") or headers.get("content-length")
@@ -109,7 +123,7 @@ def _retry_sleep(exc, attempt: int):
     return min(2**attempt, 10)
 
 
-def _download_single(task: ArchiveTask, final: Path, opener, gate: BoundedSemaphore, cancelled, on_bytes=None, retries: int = 5) -> DownloadResult:
+def _download_single(task: ArchiveTask, final: Path, opener, gate: BoundedSemaphore, cancelled, on_bytes=None, retries: int = 5, meter: TransferMeter | None = None) -> DownloadResult:
     part = final.with_name(f"{final.name}.part")
 
     for attempt in range(retries):
@@ -194,7 +208,7 @@ def _segment_ranges(total_size: int, max_segments: int) -> list[tuple[int, int]]
     return ranges
 
 
-def _download_range(task: ArchiveTask, segment_path: Path, start: int, end: int, opener, gate: BoundedSemaphore, cancelled, on_bytes=None, retries: int = 5) -> None:
+def _download_range(task: ArchiveTask, segment_path: Path, start: int, end: int, opener, gate: BoundedSemaphore, cancelled, on_bytes=None, retries: int = 5, meter: TransferMeter | None = None) -> None:
     expected_size = end - start + 1
     if segment_path.exists() and segment_path.stat().st_size == expected_size:
         return
@@ -248,7 +262,7 @@ def _download_range(task: ArchiveTask, segment_path: Path, start: int, end: int,
             time.sleep(_retry_sleep(exc, attempt))
 
 
-def _download_segmented(task: ArchiveTask, final: Path, total_size: int, max_segments: int, opener, gate: BoundedSemaphore, cancelled, on_bytes=None) -> DownloadResult:
+def _download_segmented(task: ArchiveTask, final: Path, total_size: int, max_segments: int, opener, gate: BoundedSemaphore, cancelled, on_bytes=None, meter: TransferMeter | None = None) -> DownloadResult:
     ranges = _segment_ranges(total_size, max_segments)
     segment_dir = final.with_name(f".{final.name}.segments")
     segment_dir.mkdir(parents=True, exist_ok=True)
@@ -258,7 +272,7 @@ def _download_segmented(task: ArchiveTask, final: Path, total_size: int, max_seg
             futures = []
             for index, (start, end) in enumerate(ranges):
                 segment_path = segment_dir / f"{index:02d}-{start}-{end}.part"
-                futures.append(pool.submit(_download_range, task, segment_path, start, end, opener, gate, cancelled, on_bytes))
+                futures.append(pool.submit(_download_range, task, segment_path, start, end, opener, gate, cancelled, on_bytes, 5, meter))
             for future in as_completed(futures):
                 future.result()
 
@@ -369,7 +383,7 @@ def _recover_complete_part(task: ArchiveTask, final: Path, verify: bool, opener)
     return result
 
 
-def _download_adaptive(task: ArchiveTask, root: Path, *, verify: bool, cancelled, opener, gate: BoundedSemaphore, max_segments: int, segment_threshold_bytes: int, on_bytes=None) -> DownloadResult:
+def _download_adaptive(task: ArchiveTask, root: Path, *, verify: bool, cancelled, opener, gate: BoundedSemaphore, max_segments: int, segment_threshold_bytes: int, on_bytes=None, meter: TransferMeter | None = None) -> DownloadResult:
     final = root / task.relative_path
     final.parent.mkdir(parents=True, exist_ok=True)
     part = final.with_name(f"{final.name}.part")
@@ -397,7 +411,7 @@ def _download_adaptive(task: ArchiveTask, root: Path, *, verify: bool, cancelled
     # Prefer resuming an existing combined .part before starting segmented
     # transport. This preserves already-downloaded bytes from an interrupted run.
     if part.exists() and part.stat().st_size > 0:
-        resumed = _download_single(task, final, opener, gate, cancelled, on_bytes)
+        resumed = _with_file_activity(meter, "single", _download_single, task, final, opener, gate, cancelled, on_bytes, 5, meter)
         if resumed.status == "downloaded":
             finalized = _finalize_download(resumed, final, task, verify, opener)
             if finalized.status != "failed":
@@ -410,16 +424,16 @@ def _download_adaptive(task: ArchiveTask, root: Path, *, verify: bool, cancelled
             return resumed
 
     if _eligible_for_segmentation(task) and max_segments > 1:
-        total_size, accepts_ranges = _probe_range_support(task, opener, gate)
+        total_size, accepts_ranges = _probe_range_support(task, opener, gate, meter)
         if total_size and accepts_ranges and total_size >= segment_threshold_bytes:
-            segmented = _download_segmented(task, final, total_size, max_segments, opener, gate, cancelled, on_bytes)
+            segmented = _with_file_activity(meter, "segmented", _download_segmented, task, final, total_size, max_segments, opener, gate, cancelled, on_bytes, meter)
             if segmented.status == "downloaded":
                 return _finalize_download(segmented, final, task, verify, opener)
             if segmented.status not in {"range-unsupported"}:
                 return segmented
             shutil.rmtree(final.with_name(f".{final.name}.segments"), ignore_errors=True)
 
-    single = _download_single(task, final, opener, gate, cancelled, on_bytes)
+    single = _with_file_activity(meter, "single", _download_single, task, final, opener, gate, cancelled, on_bytes, 5, meter)
     return _finalize_download(single, final, task, verify, opener)
 
 
@@ -497,6 +511,7 @@ def download_archive_library(
                     max_segments=segments,
                     segment_threshold_bytes=threshold_bytes,
                     on_bytes=meter.add_bytes,
+                    meter=meter,
                 ): task
                 for task in batch
             }
