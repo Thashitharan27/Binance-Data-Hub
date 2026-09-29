@@ -34,9 +34,13 @@ DEFAULT_FILE_WORKERS = 32
 MAX_FILE_WORKERS = 64
 DEFAULT_MAX_CONNECTIONS = 32
 MAX_CONNECTIONS = 128
-DEFAULT_SEGMENTS = 4
+DEFAULT_SEGMENTS = 8
 MAX_SEGMENTS = 8
 DEFAULT_SEGMENT_THRESHOLD_MB = 24
+# Large monthly files scale their range count by size instead of always using
+# the maximum. At the 64 MiB target, ~128 MiB uses 2 ranges, ~256 MiB uses 4,
+# and ~512 MiB can use all 8, while the global connection gate still enforces
+# the Auto-Tuned connection cap.
 TARGET_SEGMENT_BYTES = 64 * 1024 * 1024
 
 _SEGMENT_CANDIDATE_DATASETS = {
