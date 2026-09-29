@@ -15,8 +15,11 @@ from .downloader import DEFAULT_SEGMENTS
 from .responsive_gui import ResponsiveMainWindow
 from .runtime_download import download_archive_library_runtime
 from .repair import (
+    AGGTRADE_REPAIR_DATASETS,
     INTERVAL_MILLISECONDS,
     KLINE_DATASETS,
+    scan_aggtrade_range,
+    scan_and_repair_aggtrade_range,
     scan_and_repair_kline_range,
     scan_kline_range,
 )
@@ -132,19 +135,32 @@ class RepairWorker(QObject):
     @Slot()
     def run(self):
         try:
+            is_aggtrades = self.dataset in AGGTRADE_REPAIR_DATASETS
             if self.repair:
-                result = scan_and_repair_kline_range(
-                    DATA_ROOT,
-                    self.symbol,
-                    self.dataset,
-                    self.interval,
-                    self.start,
-                    self.end,
-                    verify=self.verify,
-                    max_connections=self.connections,
-                    progress=self._repair_progress,
-                    cancelled=lambda: self.cancelled,
-                )
+                if is_aggtrades:
+                    result = scan_and_repair_aggtrade_range(
+                        DATA_ROOT,
+                        self.symbol,
+                        self.start,
+                        self.end,
+                        verify=self.verify,
+                        max_connections=self.connections,
+                        progress=self._repair_progress,
+                        cancelled=lambda: self.cancelled,
+                    )
+                else:
+                    result = scan_and_repair_kline_range(
+                        DATA_ROOT,
+                        self.symbol,
+                        self.dataset,
+                        self.interval,
+                        self.start,
+                        self.end,
+                        verify=self.verify,
+                        max_connections=self.connections,
+                        progress=self._repair_progress,
+                        cancelled=lambda: self.cancelled,
+                    )
                 result["mode"] = "repair"
             else:
                 def progress(done, total, info):
@@ -154,16 +170,26 @@ class RepairWorker(QObject):
                         percent,
                     )
 
-                scan = scan_kline_range(
-                    DATA_ROOT,
-                    self.symbol,
-                    self.dataset,
-                    self.interval,
-                    self.start,
-                    self.end,
-                    progress=progress,
-                    cancelled=lambda: self.cancelled,
-                )
+                if is_aggtrades:
+                    scan = scan_aggtrade_range(
+                        DATA_ROOT,
+                        self.symbol,
+                        self.start,
+                        self.end,
+                        progress=progress,
+                        cancelled=lambda: self.cancelled,
+                    )
+                else:
+                    scan = scan_kline_range(
+                        DATA_ROOT,
+                        self.symbol,
+                        self.dataset,
+                        self.interval,
+                        self.start,
+                        self.end,
+                        progress=progress,
+                        cancelled=lambda: self.cancelled,
+                    )
                 result = {"mode": "scan", "scan": scan, "cancelled": scan.get("cancelled", False)}
             self.finished.emit(result)
         except Exception:
@@ -222,7 +248,7 @@ class RuntimeMainWindow(ResponsiveMainWindow):
         self.repair_symbol = QLineEdit("BTCUSDT")
         self.repair_symbol.setPlaceholderText("BTCUSDT")
         self.repair_dataset = QComboBox()
-        for key in KLINE_DATASETS:
+        for key in (*KLINE_DATASETS, *AGGTRADE_REPAIR_DATASETS):
             self.repair_dataset.addItem(DATASETS[key].label, key)
         self.repair_interval = QComboBox()
         for interval in INTERVAL_MILLISECONDS:
@@ -232,11 +258,13 @@ class RuntimeMainWindow(ResponsiveMainWindow):
         self.repair_end = QLineEdit()
         self.repair_end.setPlaceholderText("YYYY-MM-DD")
         repair_form.addRow("Symbol", self.repair_symbol)
-        repair_form.addRow("Kline dataset", self.repair_dataset)
+        repair_form.addRow("Dataset", self.repair_dataset)
         repair_form.addRow("Interval", self.repair_interval)
         repair_form.addRow("Start date", self.repair_start)
         repair_form.addRow("End date", self.repair_end)
         repair_layout.addLayout(repair_form)
+        self.repair_dataset.currentIndexChanged.connect(self._repair_dataset_changed)
+        self._repair_dataset_changed()
 
         repair_actions = QHBoxLayout()
         self.repair_scan_btn = QPushButton("Scan Range")
@@ -334,6 +362,15 @@ class RuntimeMainWindow(ResponsiveMainWindow):
         self.worker.failed.connect(self.thread.quit)
         self.thread.start()
 
+    def _repair_dataset_changed(self, *_args):
+        is_aggtrades = self.repair_dataset.currentData() in AGGTRADE_REPAIR_DATASETS
+        self.repair_interval.setEnabled(not is_aggtrades)
+        self.repair_interval.setToolTip(
+            "Not used for aggTrades; archive repair checks monthly/daily event ZIPs directly."
+            if is_aggtrades
+            else "Fixed UTC interval used for kline continuity and integrity repair."
+        )
+
     def _repair_request(self):
         symbol = self.repair_symbol.text().strip().upper().replace("/", "")
         dataset = self.repair_dataset.currentData()
@@ -366,11 +403,18 @@ class RuntimeMainWindow(ResponsiveMainWindow):
         self.set_busy(True)
         self.progress.setValue(0)
         self.repair_table.setRowCount(0)
-        self.repair_summary.setText(
-            "Scanning and repairing only this range..."
-            if repair
-            else "Scanning only this local range for missing/invalid candles; nothing will be downloaded..."
-        )
+        if dataset in AGGTRADE_REPAIR_DATASETS:
+            self.repair_summary.setText(
+                "Scanning and repairing aggTrades ZIP integrity only in this range..."
+                if repair
+                else "Scanning aggTrades archive presence + full ZIP/CRC integrity; nothing will be downloaded..."
+            )
+        else:
+            self.repair_summary.setText(
+                "Scanning and repairing only this range..."
+                if repair
+                else "Scanning only this local range for missing/invalid candles; nothing will be downloaded..."
+            )
         self.status.setText(self.repair_summary.text())
         self._pending_repair_result = None
         self._pending_repair_error = None
@@ -452,6 +496,41 @@ class RuntimeMainWindow(ResponsiveMainWindow):
         else:
             before = summary.get("before", {})
             after = summary.get("after", {})
+
+        if after.get("dataset") in AGGTRADE_REPAIR_DATASETS:
+            archives = after.get("archives", [])
+            rows = []
+            for item in archives:
+                if item.get("valid"):
+                    continue
+                status = "Missing archive" if not item.get("exists") else f"Invalid archive · {item.get('error') or 'integrity failure'}"
+                source = "monthly/daily archive repair" if mode == "repair" else "not attempted"
+                rows.append((item.get("key", ""), "archive", source, status))
+            self.repair_table.setRowCount(len(rows))
+            for row_index, values in enumerate(rows):
+                for col, value in enumerate(values):
+                    self.repair_table.setItem(row_index, col, QTableWidgetItem(str(value)))
+            self.repair_table.resizeColumnsToContents()
+            if mode == "repair":
+                self.repair_summary.setText(
+                    f"aggTrades before: {before.get('missing_archives', 0):,} missing and "
+                    f"{before.get('invalid_archives_count', 0):,} invalid archive(s). After repair: "
+                    f"{after.get('missing_archives', 0):,} missing and "
+                    f"{after.get('invalid_archives_count', 0):,} invalid. "
+                    f"Primary repair attempts: {summary.get('archive_repairs', 0):,}; "
+                    f"daily fallback attempts: {summary.get('daily_fallback_repairs', 0):,}. "
+                    "Each archive was fully decompressed/CRC-checked; event continuity is not fabricated."
+                )
+            else:
+                self.repair_summary.setText(
+                    f"aggTrades scan: {after.get('archives_scanned', 0):,} planned archive(s); "
+                    f"{after.get('missing_archives', 0):,} missing; "
+                    f"{after.get('invalid_archives_count', 0):,} invalid/corrupt. "
+                    "Scan validates archive presence and full ZIP/CRC integrity, not fixed-interval continuity."
+                )
+            self.status.setText(self.repair_summary.text())
+            self.progress.setValue(100)
+            return
 
         before_missing = before.get("missing_by_day", {})
         before_invalid = before.get("invalid_by_day", {})
