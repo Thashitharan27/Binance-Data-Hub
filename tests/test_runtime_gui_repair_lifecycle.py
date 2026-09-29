@@ -36,3 +36,18 @@ def test_repair_result_is_rendered_only_after_thread_finishes(monkeypatch):
     assert window.thread is None
     assert window.worker is None
     window.close()
+
+
+
+def test_aggtrades_is_available_in_repair_dataset_picker():
+    _app()
+    window = RuntimeMainWindow()
+    index = window.repair_dataset.findData("aggTrades")
+
+    assert index >= 0
+    window.repair_dataset.setCurrentIndex(index)
+    assert window.repair_interval.isEnabled() is False
+
+    window.repair_dataset.setCurrentIndex(0)
+    assert window.repair_interval.isEnabled() is True
+    window.close()
