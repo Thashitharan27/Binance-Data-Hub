@@ -48,3 +48,25 @@ See [Verified kline repair](verified_kline_repair.md) for the aggTrades reconstr
 If Strategy Lab reports five missing `1d` candles and 7,200 missing `1m` candles over the same range, the scanner can identify the exact UTC days. Since `5 × 1,440 = 7,200`, this commonly indicates five complete missing UTC days rather than random individual minute gaps.
 
 If Strategy Lab instead reports a present candle such as `TAKER_VOLUME_EXCEEDS_TOTAL` at `2023-11-30 12:35 UTC`, Data Repair first requests the Binance daily kline for that day. If that daily row is also invalid, the verified repair fallback can use that day's aggTrades evidence without modifying the original Binance archives.
+
+
+## aggTrades archive repair
+
+The Data Repair dataset picker also supports **Aggregate trades** (`aggTrades`).
+
+Unlike klines, aggTrades are an event stream and do not have a fixed expected
+event at every clock interval. The Hub therefore does **not** invent candle-style
+continuity rules for aggTrades. Instead, **Scan Range**:
+
+- plans the Binance monthly/daily aggTrades archives for the selected date range;
+- checks that each expected local archive exists;
+- fully decompresses every ZIP member and verifies ZIP/CRC integrity;
+- reports the exact monthly or daily archive that is missing or corrupt.
+
+**Scan & Repair** deletes only archives proven corrupt, re-downloads the smallest
+planned Binance archive, and fully scans the result again. If Binance does not
+publish a requested monthly archive, the repair path can request the corresponding
+daily archives.
+
+The Interval control is disabled for aggTrades because aggTrades are not a kline
+dataset.

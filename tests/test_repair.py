@@ -4,7 +4,12 @@ import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from binance_data_hub.repair import _daily_repair_tasks, _monthly_repair_tasks, scan_kline_range
+from binance_data_hub.repair import (
+    _daily_repair_tasks,
+    _monthly_repair_tasks,
+    scan_aggtrade_range,
+    scan_kline_range,
+)
 
 
 def _month_end(day: date) -> date:
@@ -208,3 +213,53 @@ def test_valid_daily_row_overrides_bad_monthly_row_without_modifying_monthly(tmp
     assert after["invalid_candles"] == 0
     assert after["complete"] is True
     assert monthly.read_bytes() == original_bytes
+
+
+
+def _aggtrade_monthly_path(root: Path, symbol: str, month: str) -> Path:
+    return (
+        root
+        / "raw"
+        / "futures"
+        / "um"
+        / "monthly"
+        / "aggTrades"
+        / symbol
+        / f"{symbol}-aggTrades-{month}.zip"
+    )
+
+
+def test_aggtrade_repair_scan_fully_checks_zip_integrity(tmp_path):
+    symbol = "BTCUSDT"
+    path = _aggtrade_monthly_path(tmp_path, symbol, "2022-03")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            f"{symbol}-aggTrades-2022-03.csv",
+            "1,43000,0.01,10,10,1646092800000,true\n",
+        )
+
+    result = scan_aggtrade_range(
+        tmp_path, symbol, date(2022, 3, 1), date(2022, 3, 31)
+    )
+
+    assert result["archives_scanned"] == 1
+    assert result["missing_archives"] == 0
+    assert result["invalid_archives_count"] == 0
+    assert result["complete"] is True
+
+
+def test_aggtrade_repair_scan_reports_corrupt_archive(tmp_path):
+    symbol = "BTCUSDT"
+    path = _aggtrade_monthly_path(tmp_path, symbol, "2022-03")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not a zip archive")
+
+    result = scan_aggtrade_range(
+        tmp_path, symbol, date(2022, 3, 1), date(2022, 3, 31)
+    )
+
+    assert result["missing_archives"] == 0
+    assert result["invalid_archives_count"] == 1
+    assert result["invalid_archive_keys"] == ["monthly:2022-03"]
+    assert result["complete"] is False
