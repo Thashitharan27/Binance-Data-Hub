@@ -198,8 +198,8 @@ class MainWindow(QMainWindow):
         form.addRow("", self.verify)
         form.addRow("Data lake", self.output)
         speed_note = QLabel(
-            "Adaptive speed mode: small files use one connection; large monthly archives may use up to four "
-            "resumable byte ranges. Auto Tune chooses the smallest connection count that reaches at least 95% "
+            "Adaptive speed mode: small files use one connection; large monthly archives dynamically use up to eight "
+            "resumable byte ranges based on file size. Auto Tune chooses the smallest connection count that reaches at least 95% "
             "of the fastest measured Binance throughput."
         )
         speed_note.setWordWrap(True)
