@@ -19,7 +19,7 @@ from threading import BoundedSemaphore
 
 import pandas as pd
 
-from .archive_downloader import ArchiveTask, Manifest, _month_end, _month_start, _next_month, _task
+from .archive_downloader import ArchiveTask, Manifest, _daily_fallback_tasks, _month_end, _month_start, _next_month, _task, plan_archive_tasks
 from .catalog import DATASETS
 from .fast_downloader import _download_adaptive
 
@@ -710,4 +710,191 @@ def scan_and_repair_kline_range(
         "source_missing_days": source_missing_days,
         "failed_days": failed_days,
         "unresolved_days": unresolved_days,
+    }
+
+
+AGGTRADE_REPAIR_DATASETS = ("aggTrades",)
+
+
+def _scan_archive_task(root: Path, task: ArchiveTask) -> dict:
+    """Fully decompress one archive so latent ZIP/zlib/CRC corruption is detected."""
+    path = root / task.relative_path
+    info = {
+        "dataset": task.dataset,
+        "period": task.period,
+        "key": task.key,
+        "path": str(path),
+        "span_start": task.span_start.isoformat(),
+        "span_end": task.span_end.isoformat(),
+        "exists": path.is_file(),
+        "valid": False,
+        "error": None,
+        "bytes": path.stat().st_size if path.is_file() else 0,
+    }
+    if not path.is_file():
+        info["error"] = "archive missing"
+        return info
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = [name for name in archive.namelist() if name.lower().endswith(".csv")]
+            if not members:
+                raise ValueError("ZIP contains no CSV file")
+            bad_member = archive.testzip()
+            if bad_member is not None:
+                raise ValueError(f"CRC/decompression failure in {bad_member}")
+            if not any(archive.getinfo(name).file_size > 0 for name in members):
+                raise ValueError("CSV payload is empty")
+        info["valid"] = True
+    except Exception as exc:
+        info["error"] = str(exc)
+    return info
+
+
+def scan_aggtrade_range(
+    root: str | Path,
+    symbol: str,
+    start_date,
+    end_date,
+    *,
+    progress=None,
+    cancelled=None,
+) -> dict:
+    """Check planned aggTrades archives for presence and full ZIP integrity.
+
+    aggTrades are event streams, not fixed-interval candles, so this intentionally
+    checks archive presence/decompression/CRC rather than inventing candle-style
+    continuity expectations.
+    """
+    symbol = _normalize_symbol(symbol)
+    start = _as_date(start_date)
+    end = _as_date(end_date)
+    if start > end:
+        raise ValueError("Start date must be on or before end date.")
+    root = Path(root).resolve()
+    tasks = plan_archive_tasks(symbol, ["aggTrades"], [], start, end)
+    archives = []
+    for index, task in enumerate(tasks, 1):
+        if cancelled and cancelled():
+            return {
+                "cancelled": True,
+                "dataset": "aggTrades",
+                "symbol": symbol,
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "archives": archives,
+            }
+        info = _scan_archive_task(root, task)
+        archives.append(info)
+        if progress:
+            progress(index, len(tasks), info)
+
+    missing = [item for item in archives if not item["exists"]]
+    invalid = [item for item in archives if item["exists"] and not item["valid"]]
+    return {
+        "cancelled": False,
+        "dataset": "aggTrades",
+        "symbol": symbol,
+        "interval": None,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "archives_scanned": len(archives),
+        "missing_archives": len(missing),
+        "invalid_archives_count": len(invalid),
+        "missing_archive_keys": [f"{item['period']}:{item['key']}" for item in missing],
+        "invalid_archive_keys": [f"{item['period']}:{item['key']}" for item in invalid],
+        "invalid_archives": invalid,
+        "archives": archives,
+        "complete": not missing and not invalid,
+    }
+
+
+def scan_and_repair_aggtrade_range(
+    root: str | Path,
+    symbol: str,
+    start_date,
+    end_date,
+    *,
+    verify: bool = False,
+    max_connections: int = 16,
+    progress=None,
+    cancelled=None,
+    opener=None,
+) -> dict:
+    """Repair missing/corrupt aggTrades archives and verify them by full decompression."""
+    root = Path(root).resolve()
+    symbol = _normalize_symbol(symbol)
+    start = _as_date(start_date)
+    end = _as_date(end_date)
+
+    def emit(stage, done, total, detail):
+        if progress:
+            progress(stage, done, total, detail)
+
+    before = scan_aggtrade_range(
+        root, symbol, start, end,
+        progress=lambda done, total, info: emit("scan-before", done, total, info),
+        cancelled=cancelled,
+    )
+    if before.get("cancelled") or before.get("complete"):
+        return {
+            "cancelled": before.get("cancelled", False),
+            "before": before,
+            "after": before,
+            "repair_results": [],
+            "archive_repairs": 0,
+            "daily_fallback_repairs": 0,
+        }
+
+    planned = plan_archive_tasks(symbol, ["aggTrades"], [], start, end)
+    repair_keys = set(before.get("missing_archive_keys", ())) | set(before.get("invalid_archive_keys", ()))
+    tasks = [task for task in planned if f"{task.period}:{task.key}" in repair_keys]
+
+    # A structurally valid central directory can still contain corrupt compressed
+    # members. Remove only archives that the full-decompression scan proved bad,
+    # otherwise the fast downloader could treat them as an existing hit.
+    invalid_paths = {Path(item["path"]) for item in before.get("invalid_archives", ())}
+    for path in invalid_paths:
+        path.unlink(missing_ok=True)
+        path.with_name(path.name + ".part").unlink(missing_ok=True)
+
+    primary_results = _run_repair_tasks(
+        tasks,
+        root,
+        verify=verify,
+        max_connections=max_connections,
+        progress=lambda done, total, result: emit("repair-archives", done, total, result),
+        cancelled=cancelled,
+        opener=opener,
+    )
+
+    fallback_tasks = []
+    for result in primary_results:
+        if result.status == "missing" and result.task.period == "monthly":
+            fallback_tasks.extend(_daily_fallback_tasks(result.task))
+    fallback_results = _run_repair_tasks(
+        fallback_tasks,
+        root,
+        verify=verify,
+        max_connections=max_connections,
+        progress=lambda done, total, result: emit("repair-daily", done, total, result),
+        cancelled=cancelled,
+        opener=opener,
+    )
+
+    after = scan_aggtrade_range(
+        root, symbol, start, end,
+        progress=lambda done, total, info: emit("scan-after", done, total, info),
+        cancelled=cancelled,
+    )
+    return {
+        "cancelled": after.get("cancelled", False),
+        "before": before,
+        "after": after,
+        "repair_results": [*primary_results, *fallback_results],
+        "archive_repairs": len(primary_results),
+        "daily_fallback_repairs": len(fallback_results),
+        "unresolved_archives": [
+            *after.get("missing_archive_keys", ()),
+            *after.get("invalid_archive_keys", ()),
+        ],
     }
