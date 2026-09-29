@@ -39,6 +39,10 @@ class TransferMeter:
         self.network_bytes = 0
         self.completed_files = 0
         self.total_files = 0
+        self.active_connections = 0
+        self.active_files = 0
+        self.active_single_files = 0
+        self.active_segmented_files = 0
         self.peak_bps = 0.0
         self.last_emit = self.started_monotonic
         self.samples = deque([(self.started_monotonic, 0)])
@@ -109,6 +113,10 @@ class TransferMeter:
             "total_files": int(self.total_files),
             "files_per_minute": files_per_minute,
             "eta_seconds": eta_seconds,
+            "active_connections": int(self.active_connections),
+            "active_files": int(self.active_files),
+            "active_single_files": int(self.active_single_files),
+            "active_segmented_files": int(self.active_segmented_files),
         }
 
     def _maybe_emit(self, force: bool = False):
@@ -138,6 +146,34 @@ class TransferMeter:
         with self.lock:
             self.completed_files = max(self.completed_files, int(completed))
             self.total_files = max(self.total_files, int(total))
+        self._maybe_emit(force=True)
+
+    def connection_started(self):
+        with self.lock:
+            self.active_connections += 1
+        self._maybe_emit(force=True)
+
+    def connection_finished(self):
+        with self.lock:
+            self.active_connections = max(0, self.active_connections - 1)
+        self._maybe_emit(force=True)
+
+    def file_started(self, mode: str):
+        with self.lock:
+            self.active_files += 1
+            if mode == "segmented":
+                self.active_segmented_files += 1
+            else:
+                self.active_single_files += 1
+        self._maybe_emit(force=True)
+
+    def file_finished(self, mode: str):
+        with self.lock:
+            self.active_files = max(0, self.active_files - 1)
+            if mode == "segmented":
+                self.active_segmented_files = max(0, self.active_segmented_files - 1)
+            else:
+                self.active_single_files = max(0, self.active_single_files - 1)
         self._maybe_emit(force=True)
 
     def snapshot(self) -> dict:

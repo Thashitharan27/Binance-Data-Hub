@@ -285,6 +285,9 @@ class MainWindow(QMainWindow):
             ("files_min", "Files / minute"),
             ("eta", "Estimated remaining"),
             ("connections", "Connection cap"),
+            ("active_connections", "Active connections"),
+            ("active_files", "Active files"),
+            ("active_modes", "File transports"),
         )
         for index, (key, title) in enumerate(fields):
             title_label = QLabel(f"{title}:")
@@ -295,7 +298,7 @@ class MainWindow(QMainWindow):
             perf_grid.addWidget(value_label, row * 2 + 1, col)
         perf_note = QLabel("ETA is based on completed-file rate, so it is approximate when file sizes vary greatly.")
         perf_note.setWordWrap(True)
-        perf_grid.addWidget(perf_note, 4, 0, 1, 4)
+        perf_grid.addWidget(perf_note, 6, 0, 1, 4)
         layout.addWidget(performance)
 
         self.table = QTableWidget(0, 5)
@@ -331,6 +334,9 @@ class MainWindow(QMainWindow):
         for label in self.perf_labels.values():
             label.setText("—")
         self.perf_labels["connections"].setText(str(self.connections.value()))
+        self.perf_labels["active_connections"].setText("0")
+        self.perf_labels["active_files"].setText("0")
+        self.perf_labels["active_modes"].setText("0 segmented / 0 single")
 
     def run_download(self):
         symbols = [item.strip().upper().replace("/", "") for item in self.symbol.text().replace(",", " ").split() if item.strip()]
@@ -423,6 +429,12 @@ class MainWindow(QMainWindow):
         eta = snapshot.get("eta_seconds")
         self.perf_labels["eta"].setText(f"~{_duration(eta)}" if eta is not None else "—")
         self.perf_labels["connections"].setText(str(self.connections.value()))
+        self.perf_labels["active_connections"].setText(str(snapshot.get("active_connections", 0)))
+        self.perf_labels["active_files"].setText(str(snapshot.get("active_files", 0)))
+        self.perf_labels["active_modes"].setText(
+            f"{snapshot.get('active_segmented_files', 0)} segmented / "
+            f"{snapshot.get('active_single_files', 0)} single"
+        )
 
     def cancel(self):
         if self.worker:
