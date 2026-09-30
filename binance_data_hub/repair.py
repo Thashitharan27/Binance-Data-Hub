@@ -717,7 +717,12 @@ AGGTRADE_REPAIR_DATASETS = ("aggTrades",)
 
 
 def _scan_archive_task(root: Path, task: ArchiveTask) -> dict:
-    """Fully decompress one archive so latent ZIP/zlib/CRC corruption is detected."""
+    """Stream-validate one aggTrades archive, including event-level invariants.
+
+    Reading every CSV row also forces ZIP decompression/CRC verification. The
+    validator intentionally keeps only the previous aggregate-trade ID so even
+    large monthly archives are checked with bounded memory.
+    """
     path = root / task.relative_path
     info = {
         "dataset": task.dataset,
@@ -730,20 +735,110 @@ def _scan_archive_task(root: Path, task: ArchiveTask) -> dict:
         "valid": False,
         "error": None,
         "bytes": path.stat().st_size if path.is_file() else 0,
+        "rows": 0,
+        "first_agg_trade_id": None,
+        "last_agg_trade_id": None,
     }
     if not path.is_file():
         info["error"] = "archive missing"
         return info
+
+    def _aggtrade_int(raw, field: str, row_number: int) -> int:
+        try:
+            return int(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid {field} at CSV row {row_number}: {raw!r}"
+            ) from exc
+
+    def _aggtrade_float(raw, field: str, row_number: int) -> float:
+        try:
+            value = float(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid {field} at CSV row {row_number}: {raw!r}"
+            ) from exc
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"{field} must be finite and positive at CSV row {row_number}: {raw!r}"
+            )
+        return value
+
     try:
+        previous_id = None
+        saw_payload = False
         with zipfile.ZipFile(path) as archive:
             members = [name for name in archive.namelist() if name.lower().endswith(".csv")]
             if not members:
                 raise ValueError("ZIP contains no CSV file")
-            bad_member = archive.testzip()
-            if bad_member is not None:
-                raise ValueError(f"CRC/decompression failure in {bad_member}")
-            if not any(archive.getinfo(name).file_size > 0 for name in members):
-                raise ValueError("CSV payload is empty")
+
+            for name in members:
+                with archive.open(name) as raw:
+                    text_stream = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
+                    reader = csv.reader(text_stream)
+                    for row_number, row in enumerate(reader, 1):
+                        if not row:
+                            continue
+
+                        first = str(row[0]).strip()
+                        normalized = "".join(ch for ch in first.lower() if ch.isalnum())
+                        if normalized in {"aggtradeid", "aggregatetradeid", "id"}:
+                            continue
+
+                        if len(row) < 7:
+                            raise ValueError(
+                                f"aggTrades schema has {len(row)} columns at CSV row "
+                                f"{row_number}; expected at least 7"
+                            )
+
+                        agg_trade_id = _aggtrade_int(row[0], "aggTradeId", row_number)
+                        price = _aggtrade_float(row[1], "price", row_number)
+                        quantity = _aggtrade_float(row[2], "quantity", row_number)
+                        first_trade_id = _aggtrade_int(row[3], "firstTradeId", row_number)
+                        last_trade_id = _aggtrade_int(row[4], "lastTradeId", row_number)
+                        transact_time = _aggtrade_int(row[5], "transactTime", row_number)
+                        maker = str(row[6]).strip().lower()
+
+                        # Bind parsed values so validation remains explicit even though
+                        # price/quantity are not otherwise used by the scanner.
+                        _ = price, quantity
+                        if agg_trade_id < 0 or first_trade_id < 0 or last_trade_id < 0:
+                            raise ValueError(
+                                f"trade IDs must be non-negative at CSV row {row_number}"
+                            )
+                        if last_trade_id < first_trade_id:
+                            raise ValueError(
+                                f"lastTradeId is below firstTradeId at CSV row {row_number}"
+                            )
+                        if transact_time <= 0:
+                            raise ValueError(
+                                f"transactTime must be positive at CSV row {row_number}"
+                            )
+                        if maker not in {"true", "false", "1", "0", "t", "f"}:
+                            raise ValueError(
+                                f"invalid isBuyerMaker at CSV row {row_number}: {row[6]!r}"
+                            )
+
+                        if previous_id is not None and agg_trade_id <= previous_id:
+                            if agg_trade_id == previous_id:
+                                raise ValueError(
+                                    f"duplicate aggTradeId {agg_trade_id} at CSV row {row_number}"
+                                )
+                            raise ValueError(
+                                f"aggTradeId moved backward from {previous_id} to "
+                                f"{agg_trade_id} at CSV row {row_number}"
+                            )
+
+                        if info["first_agg_trade_id"] is None:
+                            info["first_agg_trade_id"] = agg_trade_id
+                        info["last_agg_trade_id"] = agg_trade_id
+                        previous_id = agg_trade_id
+                        info["rows"] += 1
+                        saw_payload = True
+
+        if not saw_payload:
+            raise ValueError("CSV contains no aggTrades rows")
+
         info["valid"] = True
     except Exception as exc:
         info["error"] = str(exc)
