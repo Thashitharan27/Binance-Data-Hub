@@ -249,6 +249,52 @@ def test_aggtrade_repair_scan_fully_checks_zip_integrity(tmp_path):
     assert result["complete"] is True
 
 
+def test_aggtrade_repair_scan_rejects_duplicate_aggregate_trade_ids(tmp_path):
+    symbol = "BTCUSDT"
+    path = _aggtrade_monthly_path(tmp_path, symbol, "2022-09")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            f"{symbol}-aggTrades-2022-09.csv",
+            "".join(
+                [
+                    "100,20000,0.01,500,500,1661990400000,true\n",
+                    "101,20001,0.02,501,501,1661990401000,false\n",
+                    "101,20002,0.03,502,502,1661990402000,true\n",
+                ]
+            ),
+        )
+
+    result = scan_aggtrade_range(
+        tmp_path, symbol, date(2022, 9, 1), date(2022, 9, 30)
+    )
+
+    assert result["missing_archives"] == 0
+    assert result["invalid_archives_count"] == 1
+    assert result["invalid_archive_keys"] == ["monthly:2022-09"]
+    assert "duplicate aggTradeId 101" in result["invalid_archives"][0]["error"]
+    assert result["complete"] is False
+
+
+def test_aggtrade_repair_scan_rejects_invalid_event_geometry(tmp_path):
+    symbol = "BTCUSDT"
+    path = _aggtrade_monthly_path(tmp_path, symbol, "2022-09")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            f"{symbol}-aggTrades-2022-09.csv",
+            "100,20000,0.01,501,500,1661990400000,true\n",
+        )
+
+    result = scan_aggtrade_range(
+        tmp_path, symbol, date(2022, 9, 1), date(2022, 9, 30)
+    )
+
+    assert result["invalid_archives_count"] == 1
+    assert "lastTradeId is below firstTradeId" in result["invalid_archives"][0]["error"]
+    assert result["complete"] is False
+
+
 def test_aggtrade_repair_scan_reports_corrupt_archive(tmp_path):
     symbol = "BTCUSDT"
     path = _aggtrade_monthly_path(tmp_path, symbol, "2022-03")
