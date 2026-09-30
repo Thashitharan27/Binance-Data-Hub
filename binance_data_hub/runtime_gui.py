@@ -407,7 +407,7 @@ class RuntimeMainWindow(ResponsiveMainWindow):
             self.repair_summary.setText(
                 "Scanning and repairing aggTrades ZIP integrity only in this range..."
                 if repair
-                else "Scanning aggTrades archive presence + full ZIP/CRC integrity; nothing will be downloaded..."
+                else "Scanning aggTrades archive + event integrity (ZIP/CRC, schema, IDs, values); nothing will be downloaded..."
             )
         else:
             self.repair_summary.setText(
@@ -519,14 +519,14 @@ class RuntimeMainWindow(ResponsiveMainWindow):
                     f"{after.get('invalid_archives_count', 0):,} invalid. "
                     f"Primary repair attempts: {summary.get('archive_repairs', 0):,}; "
                     f"daily fallback attempts: {summary.get('daily_fallback_repairs', 0):,}. "
-                    "Each archive was fully decompressed/CRC-checked; event continuity is not fabricated."
+                    "Each archive was fully streamed and checked for ZIP/CRC plus aggTrade row/schema/ID/value integrity; event continuity is not fabricated."
                 )
             else:
                 self.repair_summary.setText(
                     f"aggTrades scan: {after.get('archives_scanned', 0):,} planned archive(s); "
                     f"{after.get('missing_archives', 0):,} missing; "
                     f"{after.get('invalid_archives_count', 0):,} invalid/corrupt. "
-                    "Scan validates archive presence and full ZIP/CRC integrity, not fixed-interval continuity."
+                    "Scan validates archive presence, ZIP/CRC, aggTrade row/schema/ID/value integrity, and strict increasing aggregate-trade IDs; it does not invent fixed-interval continuity."
                 )
             self.status.setText(self.repair_summary.text())
             self.progress.setValue(100)
