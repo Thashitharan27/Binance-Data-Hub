@@ -854,11 +854,12 @@ def scan_aggtrade_range(
     progress=None,
     cancelled=None,
 ) -> dict:
-    """Check planned aggTrades archives for presence and full ZIP integrity.
+    """Check planned aggTrades archives for source and event integrity.
 
-    aggTrades are event streams, not fixed-interval candles, so this intentionally
-    checks archive presence/decompression/CRC rather than inventing candle-style
-    continuity expectations.
+    aggTrades are event streams, not fixed-interval candles, so the scan validates
+    archive presence/decompression/CRC plus row schema, numeric domains, trade-ID
+    ordering/uniqueness, and basic Binance event invariants without inventing
+    candle-style continuity expectations.
     """
     symbol = _normalize_symbol(symbol)
     start = _as_date(start_date)
@@ -915,7 +916,7 @@ def scan_and_repair_aggtrade_range(
     cancelled=None,
     opener=None,
 ) -> dict:
-    """Repair missing/corrupt aggTrades archives and verify them by full decompression."""
+    """Repair missing/invalid aggTrades archives and verify archive + event integrity."""
     root = Path(root).resolve()
     symbol = _normalize_symbol(symbol)
     start = _as_date(start_date)
