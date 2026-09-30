@@ -3,11 +3,14 @@ from __future__ import annotations
 import zipfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
+import binance_data_hub.repair as repair_module
 from binance_data_hub.repair import (
     _daily_repair_tasks,
     _monthly_repair_tasks,
     scan_aggtrade_range,
+    scan_and_repair_aggtrade_range,
     scan_kline_range,
 )
 
@@ -227,6 +230,109 @@ def _aggtrade_monthly_path(root: Path, symbol: str, month: str) -> Path:
         / symbol
         / f"{symbol}-aggTrades-{month}.zip"
     )
+
+
+def _aggtrade_daily_path(root: Path, symbol: str, day: date) -> Path:
+    return (
+        root
+        / "raw"
+        / "futures"
+        / "um"
+        / "daily"
+        / "aggTrades"
+        / symbol
+        / f"{symbol}-aggTrades-{day.isoformat()}.zip"
+    )
+
+
+def _write_aggtrade_archive(path: Path, rows: list[str]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(path.stem + ".csv", "".join(rows))
+    return path
+
+
+def test_aggtrade_scan_uses_daily_fallback_when_monthly_source_is_absent(tmp_path):
+    symbol = "BTCUSDT"
+    start = date(2022, 9, 1)
+    end = date(2022, 9, 2)
+    for offset, day in enumerate((start, end)):
+        _write_aggtrade_archive(
+            _aggtrade_daily_path(tmp_path, symbol, day),
+            [
+                f"{100 + offset},20000,0.01,{500 + offset},{500 + offset},"
+                f"{1661990400000 + offset * 86400000},true\n"
+            ],
+        )
+
+    result = scan_aggtrade_range(tmp_path, symbol, start, end)
+
+    assert result["archives_scanned"] == 2
+    assert result["missing_archives"] == 0
+    assert result["invalid_archives_count"] == 0
+    assert result["complete"] is True
+
+
+def test_aggtrade_repair_falls_back_to_daily_if_official_monthly_stays_invalid(
+    tmp_path, monkeypatch
+):
+    symbol = "BTCUSDT"
+    start = date(2022, 9, 1)
+    end = date(2022, 9, 2)
+    monthly = _aggtrade_monthly_path(tmp_path, symbol, "2022-09")
+    _write_aggtrade_archive(
+        monthly,
+        [
+            "100,20000,0.01,500,500,1661990400000,true\n",
+            "100,20001,0.02,501,501,1661990401000,false\n",
+        ],
+    )
+
+    calls = []
+
+    def fake_run(tasks, root, **_kwargs):
+        calls.append([task.period for task in tasks])
+        results = []
+        for index, task in enumerate(tasks):
+            path = Path(root) / task.relative_path
+            if task.period == "monthly":
+                _write_aggtrade_archive(
+                    path,
+                    [
+                        "100,20000,0.01,500,500,1661990400000,true\n",
+                        "100,20001,0.02,501,501,1661990401000,false\n",
+                    ],
+                )
+            else:
+                agg_id = 200 + index
+                trade_id = 600 + index
+                timestamp = int(
+                    datetime.combine(
+                        task.span_start, datetime.min.time(), tzinfo=timezone.utc
+                    ).timestamp()
+                    * 1000
+                )
+                _write_aggtrade_archive(
+                    path,
+                    [
+                        f"{agg_id},20000,0.01,{trade_id},{trade_id},"
+                        f"{timestamp},true\n"
+                    ],
+                )
+            results.append(SimpleNamespace(status="downloaded", task=task))
+        return results
+
+    monkeypatch.setattr(repair_module, "_run_repair_tasks", fake_run)
+
+    result = scan_and_repair_aggtrade_range(
+        tmp_path, symbol, start, end, max_connections=2
+    )
+
+    assert result["before"]["invalid_archives_count"] == 1
+    assert result["after"]["complete"] is True
+    assert result["daily_fallback_repairs"] == 2
+    assert not monthly.exists()
+    assert calls == [["monthly"], ["daily", "daily"]]
 
 
 def test_aggtrade_repair_scan_fully_checks_zip_integrity(tmp_path):
