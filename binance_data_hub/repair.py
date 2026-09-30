@@ -716,6 +716,34 @@ def scan_and_repair_kline_range(
 AGGTRADE_REPAIR_DATASETS = ("aggTrades",)
 
 
+def _aggtrade_effective_scan_tasks(root: Path, planned: list[ArchiveTask]) -> list[ArchiveTask]:
+    """Select the source files that currently form the effective aggTrades repair set.
+
+    Historical months normally use one monthly ZIP. If that monthly ZIP has been
+    deliberately removed during repair and at least one daily fallback exists,
+    scan the complete daily set instead. Including every expected daily task means
+    a partial fallback is reported as missing days rather than being mistaken for
+    a healthy repaired month.
+    """
+    effective: list[ArchiveTask] = []
+    for task in planned:
+        if task.period != "monthly":
+            effective.append(task)
+            continue
+
+        monthly_path = root / task.relative_path
+        if monthly_path.is_file():
+            effective.append(task)
+            continue
+
+        daily_tasks = _daily_fallback_tasks(task)
+        if any((root / daily.relative_path).is_file() for daily in daily_tasks):
+            effective.extend(daily_tasks)
+        else:
+            effective.append(task)
+    return effective
+
+
 def _scan_archive_task(root: Path, task: ArchiveTask) -> dict:
     """Stream-validate one aggTrades archive, including event-level invariants.
 
@@ -867,7 +895,8 @@ def scan_aggtrade_range(
     if start > end:
         raise ValueError("Start date must be on or before end date.")
     root = Path(root).resolve()
-    tasks = plan_archive_tasks(symbol, ["aggTrades"], [], start, end)
+    planned = plan_archive_tasks(symbol, ["aggTrades"], [], start, end)
+    tasks = _aggtrade_effective_scan_tasks(root, planned)
     archives = []
     for index, task in enumerate(tasks, 1):
         if cancelled and cancelled():
@@ -963,10 +992,60 @@ def scan_and_repair_aggtrade_range(
         opener=opener,
     )
 
+    # Re-scan the freshly downloaded primary sources. Binance can occasionally
+    # publish a structurally valid monthly ZIP whose CSV still violates aggTrade
+    # event invariants (for example duplicate aggregate-trade IDs). Re-downloading
+    # the same official monthly file cannot repair that upstream defect, so fall
+    # back to the official daily archives for that month and leave the bad monthly
+    # source absent. This is important because downstream consumers recursively
+    # discover files and would otherwise continue to read the invalid monthly ZIP.
+    middle = scan_aggtrade_range(
+        root, symbol, start, end,
+        progress=lambda done, total, info: emit("scan-middle", done, total, info),
+        cancelled=cancelled,
+    )
+    if middle.get("cancelled"):
+        return {
+            "cancelled": True,
+            "before": before,
+            "after": middle,
+            "repair_results": primary_results,
+            "archive_repairs": len(primary_results),
+            "daily_fallback_repairs": 0,
+            "unresolved_archives": [
+                *middle.get("missing_archive_keys", ()),
+                *middle.get("invalid_archive_keys", ()),
+            ],
+        }
+
+    planned_by_key = {
+        f"{task.period}:{task.key}": task
+        for task in planned
+    }
     fallback_tasks = []
+
     for result in primary_results:
         if result.status == "missing" and result.task.period == "monthly":
             fallback_tasks.extend(_daily_fallback_tasks(result.task))
+
+    for item in middle.get("invalid_archives", ()):
+        if item.get("period") != "monthly":
+            continue
+        task = planned_by_key.get(f"monthly:{item.get('key')}")
+        if task is None:
+            continue
+        bad_path = Path(item["path"])
+        bad_path.unlink(missing_ok=True)
+        bad_path.with_name(bad_path.name + ".part").unlink(missing_ok=True)
+        fallback_tasks.extend(_daily_fallback_tasks(task))
+
+    # De-duplicate fallbacks because the same month can be both unavailable from
+    # the primary download and invalid after a successful-looking download.
+    unique_fallbacks = {}
+    for task in fallback_tasks:
+        unique_fallbacks[str(task.relative_path)] = task
+    fallback_tasks = list(unique_fallbacks.values())
+
     fallback_results = _run_repair_tasks(
         fallback_tasks,
         root,
