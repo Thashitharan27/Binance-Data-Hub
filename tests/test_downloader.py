@@ -109,6 +109,82 @@ def test_404_is_missing_not_failed(tmp_path):
     assert result.status == "missing"
 
 
+def test_completed_aggtrade_monthly_download_removes_obsolete_daily_overlap(tmp_path):
+    payload = b"PK" + b"a" * 64
+    daily_dir = (
+        tmp_path
+        / "raw"
+        / "futures"
+        / "um"
+        / "daily"
+        / "aggTrades"
+        / "BTCUSDT"
+    )
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    obsolete = daily_dir / "BTCUSDT-aggTrades-2026-08-02.zip"
+    obsolete.write_bytes(b"old-daily")
+    older_month = daily_dir / "BTCUSDT-aggTrades-2026-07-31.zip"
+    older_month.write_bytes(b"keep")
+
+    def opener(request, **_kwargs):
+        return Response(payload)
+
+    summary = download_archive_library(
+        "BTCUSDT",
+        ["aggTrades"],
+        [],
+        tmp_path,
+        "2026-08-01",
+        "2026-08-31",
+        workers=1,
+        verify=False,
+        opener=opener,
+        today=date(2026, 9, 2),
+    )
+
+    assert summary["counts"]["downloaded"] == 1
+    assert not obsolete.exists()
+    assert older_month.exists()
+    assert summary["removed_superseded_daily"] == [str(obsolete)]
+
+
+def test_monthly_kline_download_does_not_remove_daily_repair_source(tmp_path):
+    payload = b"PK" + b"k" * 64
+    daily_dir = (
+        tmp_path
+        / "raw"
+        / "futures"
+        / "um"
+        / "daily"
+        / "klines"
+        / "BTCUSDT"
+        / "1m"
+    )
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    repair_daily = daily_dir / "BTCUSDT-1m-2026-08-02.zip"
+    repair_daily.write_bytes(b"repair-daily")
+
+    def opener(request, **_kwargs):
+        return Response(payload)
+
+    summary = download_archive_library(
+        "BTCUSDT",
+        ["klines"],
+        ["1m"],
+        tmp_path,
+        "2026-08-01",
+        "2026-08-31",
+        workers=1,
+        verify=False,
+        opener=opener,
+        today=date(2026, 9, 2),
+    )
+
+    assert summary["counts"]["downloaded"] == 1
+    assert repair_daily.exists()
+    assert summary["removed_superseded_daily"] == []
+
+
 def test_multi_symbol_collection_plans_in_one_run(tmp_path):
     payload = b"PK" + b"z" * 32
 
