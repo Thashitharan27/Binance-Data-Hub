@@ -297,6 +297,78 @@ class Manifest:
             )
 
 
+    def remove_daily_month(
+        self,
+        dataset: str,
+        symbol: str,
+        month_key: str,
+        interval: str | None = None,
+    ) -> None:
+        """Remove manifest rows superseded by one completed monthly archive."""
+        prefix = f"{month_key}-"
+        with self.lock, sqlite3.connect(self.path) as db:
+            db.execute(
+                """
+                DELETE FROM archives
+                WHERE dataset = ?
+                  AND symbol = ?
+                  AND period = 'daily'
+                  AND interval = ?
+                  AND key LIKE ?
+                """,
+                (dataset, symbol, interval or "", prefix + "%"),
+            )
+
+
+def _cleanup_superseded_aggtrade_daily_archives(
+    root: Path,
+    manifest: Manifest,
+    results: list[DownloadResult],
+) -> list[str]:
+    """Keep exactly one effective aggTrades source for completed months.
+
+    Daily aggTrades are used while a month is still current and as an explicit
+    repair fallback when the monthly source is absent. Once a completed monthly
+    archive exists locally after a normal collection run, any older daily ZIPs
+    for that same month are obsolete and would create overlapping sources for
+    Strategy Lab. This cleanup is intentionally aggTrades-only because kline
+    repair workflows deliberately allow daily rows to override monthly rows.
+    """
+    removed: list[str] = []
+    for result in results:
+        task = result.task
+        if (
+            task.dataset != "aggTrades"
+            or task.period != "monthly"
+            or result.status not in {"downloaded", "skipped"}
+        ):
+            continue
+
+        monthly_path = root / task.relative_path
+        if not monthly_path.is_file():
+            continue
+
+        daily_dir = (
+            root
+            / "raw"
+            / "futures"
+            / "um"
+            / "daily"
+            / "aggTrades"
+            / task.symbol
+        )
+        pattern = f"{task.symbol}-aggTrades-{task.key}-*.zip"
+        if daily_dir.is_dir():
+            for path in sorted(daily_dir.glob(pattern)):
+                path.unlink(missing_ok=True)
+                path.with_name(path.name + ".part").unlink(missing_ok=True)
+                removed.append(str(path))
+        manifest.remove_daily_month(
+            task.dataset, task.symbol, task.key, task.interval
+        )
+    return removed
+
+
 def _daily_fallback_tasks(task: ArchiveTask) -> list[ArchiveTask]:
     spec = DATASETS[task.dataset]
     if task.period != "monthly" or not spec.daily:
@@ -392,6 +464,9 @@ def download_archive_library(
         fallback_results = run_batch(fallbacks, len(primary), len(tasks) + len(fallbacks))
         results.extend(fallback_results)
 
+    removed_superseded_daily = _cleanup_superseded_aggtrade_daily_archives(
+        root, manifest, primary
+    )
     counts = {status: sum(1 for item in results if item.status == status) for status in ("downloaded", "skipped", "missing", "failed", "cancelled")}
     return {
         "root": str(root),
@@ -400,5 +475,6 @@ def download_archive_library(
         "files": len(results),
         "bytes_downloaded": sum(item.bytes for item in results if item.status == "downloaded"),
         "counts": counts,
+        "removed_superseded_daily": removed_superseded_daily,
         "results": results,
     }

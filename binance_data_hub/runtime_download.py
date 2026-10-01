@@ -6,7 +6,12 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-from .archive_downloader import Manifest, _daily_fallback_tasks, plan_archive_tasks
+from .archive_downloader import (
+    Manifest,
+    _cleanup_superseded_aggtrade_daily_archives,
+    _daily_fallback_tasks,
+    plan_archive_tasks,
+)
 from .fast_downloader import (
     DEFAULT_FILE_WORKERS,
     DEFAULT_MAX_CONNECTIONS,
@@ -182,6 +187,9 @@ def download_archive_library_runtime(
     finally:
         calibrator.stop()
 
+    removed_superseded_daily = _cleanup_superseded_aggtrade_daily_archives(
+        root, manifest, primary
+    )
     statuses = ("downloaded", "skipped", "missing", "failed", "cancelled")
     counts = {status: sum(1 for item in results if item.status == status) for status in statuses}
     segmented_files = sum(
@@ -199,6 +207,7 @@ def download_archive_library_runtime(
         "files": len(results),
         "bytes_downloaded": sum(item.bytes for item in results if item.status == "downloaded"),
         "counts": counts,
+        "removed_superseded_daily": removed_superseded_daily,
         "segmented_files": segmented_files,
         "performance": performance,
         "max_connections": max_connections,
