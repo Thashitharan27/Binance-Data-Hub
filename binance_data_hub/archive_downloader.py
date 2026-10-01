@@ -314,9 +314,9 @@ class Manifest:
                   AND symbol = ?
                   AND period = 'daily'
                   AND interval = ?
-                  AND starts_with(key, ?)
+                  AND key LIKE ?
                 """,
-                (dataset, symbol, interval or "", prefix),
+                (dataset, symbol, interval or "", prefix + "%"),
             )
 
 
