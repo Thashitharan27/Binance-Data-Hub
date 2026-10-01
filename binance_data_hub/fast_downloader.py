@@ -22,6 +22,7 @@ from .archive_downloader import (
     ArchiveTask,
     DownloadResult,
     Manifest,
+    _cleanup_superseded_aggtrade_daily_archives,
     _daily_fallback_tasks,
     _fetch_checksum,
     _sha256,
@@ -549,6 +550,9 @@ def download_archive_library(
         meter.mark_files(len(primary), total_with_fallbacks)
         results.extend(run_batch(fallbacks, len(primary), total_with_fallbacks))
 
+    removed_superseded_daily = _cleanup_superseded_aggtrade_daily_archives(
+        root, manifest, primary
+    )
     statuses = ("downloaded", "skipped", "missing", "failed", "cancelled")
     counts = {status: sum(1 for item in results if item.status == status) for status in statuses}
     segmented_files = sum(
@@ -568,6 +572,7 @@ def download_archive_library(
         "files": len(results),
         "bytes_downloaded": sum(item.bytes for item in results if item.status == "downloaded"),
         "counts": counts,
+        "removed_superseded_daily": removed_superseded_daily,
         "segmented_files": segmented_files,
         "recovered_parts": recovered_parts,
         "performance": performance,
